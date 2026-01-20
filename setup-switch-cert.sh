@@ -21,12 +21,12 @@ if [ $# -lt 5 ]; then
     echo "  password     Switch admin password"
     echo ""
     echo "This will create a certificate with the following SANs:"
+    echo "  - <switch-name>.<domain>  (primary)"
+    echo "  - ipv4.<switch-name>.<domain>"
+    echo "  - ipv6.<switch-name>.<domain>"
     echo "  - manage.<switch-name>.<domain>"
     echo "  - ipv4.manage.<switch-name>.<domain>"
     echo "  - ipv6.manage.<switch-name>.<domain>"
-    echo "  - <switch-name>.<domain>"
-    echo "  - ipv4.<switch-name>.<domain>"
-    echo "  - ipv6.<switch-name>.<domain>"
     exit 1
 fi
 
@@ -37,16 +37,17 @@ IP="$4"
 PASSWORD="$5"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CERT_NAME="manage.${SWITCH_NAME}.${DOMAIN}"
+CERT_NAME="${SWITCH_NAME}.${DOMAIN}"
 
 # Build the list of SANs
+# Primary SAN is <switch-name>.<domain>, others are secondary
 SANS=(
-    "manage.${SWITCH_NAME}.${DOMAIN}"
-    "ipv4.manage.${SWITCH_NAME}.${DOMAIN}"
-    "ipv6.manage.${SWITCH_NAME}.${DOMAIN}"
     "${SWITCH_NAME}.${DOMAIN}"
     "ipv4.${SWITCH_NAME}.${DOMAIN}"
     "ipv6.${SWITCH_NAME}.${DOMAIN}"
+    "manage.${SWITCH_NAME}.${DOMAIN}"
+    "ipv4.manage.${SWITCH_NAME}.${DOMAIN}"
+    "ipv6.manage.${SWITCH_NAME}.${DOMAIN}"
 )
 
 echo "=============================================="
