@@ -74,6 +74,61 @@ class NetgearSwitchUpdater:
         """Log out of the switch web interface."""
         pass  # Optional, not all switches require explicit logout
 
+    def reboot(self) -> bool:
+        """Reboot the switch to apply certificate changes."""
+        raise NotImplementedError("Subclasses must implement reboot()")
+
+    def wait_for_reboot(self, timeout: int = 180) -> bool:
+        """
+        Wait for the switch to come back online after reboot.
+
+        Polls the switch HTTP interface until it responds or timeout is reached.
+        Returns True if switch comes back online, False on timeout.
+        """
+        import time
+        import socket
+
+        url_parts = urlparse(self.switch_url)
+        hostname = url_parts.hostname
+        port = url_parts.port or 80
+
+        self.logger.info(f"Waiting for switch to reboot (timeout: {timeout}s)...")
+
+        # First, wait for switch to go down (stop responding)
+        start_time = time.time()
+        went_down = False
+        while time.time() - start_time < 30:  # Give it 30s to start rebooting
+            try:
+                sock = socket.create_connection((hostname, port), timeout=2)
+                sock.close()
+                self.logger.debug("Switch still responding, waiting for reboot...")
+                time.sleep(2)
+            except (socket.timeout, socket.error, ConnectionRefusedError):
+                self.logger.debug("Switch stopped responding - reboot in progress")
+                went_down = True
+                break
+
+        if not went_down:
+            self.logger.warning("Switch never went down - reboot may not have triggered")
+
+        # Now wait for switch to come back
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            try:
+                sock = socket.create_connection((hostname, port), timeout=5)
+                sock.close()
+                self.logger.info("Switch is back online")
+                # Give it a few more seconds to fully initialize
+                time.sleep(5)
+                return True
+            except (socket.timeout, socket.error, ConnectionRefusedError):
+                elapsed = int(time.time() - start_time)
+                self.logger.debug(f"Switch not yet responding ({elapsed}s elapsed)...")
+                time.sleep(5)
+
+        self.logger.error(f"Switch did not come back online within {timeout}s")
+        return False
+
     def verify_certificate(self, cert_file: str) -> bool:
         """
         Verify the switch is serving the expected certificate via HTTPS.
@@ -364,6 +419,61 @@ class GS728TPPUpdater(NetgearSwitchUpdater):
 
         return ''.join(parts)
 
+    def reboot(self) -> bool:
+        """
+        Reboot GS728TPP via XML API.
+
+        Posts Reload XML to /wcd endpoint.
+        """
+        if not self.base_url:
+            self.logger.error("Not logged in - call login() first")
+            return False
+
+        xml_payload = (
+            "<?xml version='1.0' encoding='utf-8'?>"
+            "<Reload action=\"set\">"
+            "<UnitList>"
+            "<UnitEntry>"
+            "<unitID>0</unitID>"
+            "</UnitEntry>"
+            "</UnitList>"
+            "</Reload>"
+        )
+
+        wcd_url = f"{self.base_url}/wcd"
+        headers = {
+            'Content-Type': 'application/xml; charset=utf-8',
+        }
+
+        try:
+            self.logger.info("Sending reboot command...")
+            resp = self.session.post(
+                wcd_url,
+                data=xml_payload,
+                headers=headers,
+                timeout=REQUEST_TIMEOUT
+            )
+        except requests.RequestException as e:
+            # Connection may be dropped as switch reboots - that's OK
+            self.logger.debug(f"Reboot request exception (expected): {e}")
+            return True
+
+        self.logger.debug(f"Reboot response status: {resp.status_code}")
+        self.logger.debug(f"Reboot response: {resp.text[:200] if resp.text else 'empty'}")
+
+        # Check for errors in response
+        if resp.status_code == 200:
+            status_match = re.search(r'<statusCode>(\d+)</statusCode>', resp.text)
+            if status_match:
+                status_code = int(status_match.group(1))
+                if status_code != 0:
+                    status_string_match = re.search(r'<statusString>([^<]*)</statusString>', resp.text)
+                    status_string = status_string_match.group(1) if status_string_match else "Unknown error"
+                    self.logger.error(f"Reboot failed: {status_string} (statusCode={status_code})")
+                    return False
+
+        return True
+
 
 class S3300Updater(NetgearSwitchUpdater):
     """
@@ -473,6 +583,60 @@ class S3300Updater(NetgearSwitchUpdater):
             return False
 
         return True
+
+    def reboot(self) -> bool:
+        """
+        Reboot S3300 via form POST.
+
+        Posts to /deviceReboot.html/a1 with reboot checkbox enabled.
+        """
+        if not self.logged_in:
+            self.logger.error("Not logged in - call login() first")
+            return False
+
+        reboot_url = f"{self.switch_url}/deviceReboot.html/a1"
+
+        # Form data to trigger reboot - mimics the web interface form submission
+        data = {
+            'v_1_1_1_extn': '',
+            'v_1_1_1': 'All',  # Reboot all units
+            'v_1_1_2': '2',
+            'v_1_1_3': '1',
+            'v_1_2_1': 'on',  # Enable reboot (checkbox checked)
+            'v_1_3_3': '',
+            'v_1_3_31': '',
+            'v_2_1_1': '',
+            'submit_flag': '0',
+            'submit_target': 'deviceReboot.html',
+            'err_flag': '0',
+            'err_msg': '',
+            'clazz_information': 'deviceReboot.html',
+            'v_1_3_2': 'CANCEL',
+            'v_1_3_1': 'APPLY',
+        }
+
+        try:
+            self.logger.info("Sending reboot command...")
+            resp = self.session.post(
+                reboot_url,
+                data=data,
+                timeout=REQUEST_TIMEOUT
+            )
+        except requests.RequestException as e:
+            # Connection may be dropped as switch reboots - that's OK
+            self.logger.debug(f"Reboot request exception (expected): {e}")
+            return True
+
+        self.logger.debug(f"Reboot response status: {resp.status_code}")
+        resp.encoding = 'utf-8'
+        response_text = resp.text if resp.text else ''
+        self.logger.debug(f"Reboot response: {response_text[:200] if response_text else 'empty'}")
+
+        # Check for reboot confirmation in response
+        if 'reboot' in response_text.lower() or resp.status_code == 200:
+            return True
+
+        return False
 
 
 def parse_cert_info(pem_file: str) -> dict:
@@ -603,6 +767,10 @@ Examples:
                         help='Path to certificate PEM file')
     parser.add_argument('--key-file', required=True,
                         help='Path to private key PEM file')
+    parser.add_argument('--reboot', action='store_true',
+                        help='Reboot switch after upload to apply certificate')
+    parser.add_argument('--reboot-timeout', type=int, default=180,
+                        help='Timeout in seconds to wait for switch reboot (default: 180)')
     parser.add_argument('--quiet', action='store_true',
                         help='Suppress output on success')
     parser.add_argument('--debug', action='store_true',
@@ -665,17 +833,42 @@ Examples:
         logger.error("Failed to upload certificate")
         sys.exit(2)
 
-    updater.logout()
-
     if not args.quiet:
         logger.info("Certificate uploaded successfully")
+
+    # Handle reboot if requested
+    if args.reboot:
+        if not args.quiet:
+            logger.info("Rebooting switch to apply certificate...")
+
+        if not updater.reboot():
+            logger.error("Failed to send reboot command")
+            sys.exit(2)
+
+        if not updater.wait_for_reboot(timeout=args.reboot_timeout):
+            logger.error("Switch did not come back online after reboot")
+            sys.exit(2)
+
+        if not args.quiet:
+            logger.info("Switch rebooted successfully")
+
+    updater.logout()
 
     # Verify the certificate is now being served
     if not args.quiet:
         logger.info("Verifying certificate deployment...")
+
     if not updater.verify_certificate(args.cert_file):
-        logger.error("Certificate verification failed")
+        if args.reboot:
+            logger.error("Certificate verification failed after reboot")
+        else:
+            logger.error("Certificate verification failed")
+            logger.error("The switch may need a reboot to apply the new certificate.")
+            logger.error("Try running with --reboot option.")
         sys.exit(2)
+
+    if not args.quiet:
+        logger.info("Certificate deployment verified successfully")
 
 
 if __name__ == "__main__":
