@@ -419,6 +419,43 @@ class GS728TPPUpdater(NetgearSwitchUpdater):
 
         return ''.join(parts)
 
+    def enable_https(self) -> bool:
+        """
+        Enable HTTPS admin mode on GS728TPP via form POST.
+
+        This is required for the switch to serve HTTPS on port 443.
+        Without this, certificate uploads succeed but HTTPS remains disabled.
+        """
+        if not self.base_url:
+            self.logger.error("Not logged in - call login() first")
+            return False
+
+        form_url = f"{self.base_url}/Security/Access/HTTPSConfiguration.htm"
+
+        # Form data to enable HTTPS
+        # rlEmWebHttpsEnable: 1 = Enable, 2 = Disable
+        data = {
+            'restoreUrl': '',
+            'errorCollector': '',
+            'rlEmWebHttpsEnable': '1',
+            'rlEmWebHttpsPort': '443',
+            'rlEmWebMaxHttpsIdleTimeout': '300',  # 5 minutes in seconds
+        }
+
+        try:
+            self.logger.debug("Enabling HTTPS admin mode...")
+            resp = self.session.post(form_url, data=data, timeout=REQUEST_TIMEOUT)
+        except requests.RequestException as e:
+            self.logger.error(f"Failed to enable HTTPS: {e}")
+            return False
+
+        if resp.status_code != 200:
+            self.logger.error(f"Failed to enable HTTPS: status {resp.status_code}")
+            return False
+
+        self.logger.info("HTTPS admin mode enabled")
+        return True
+
     def reboot(self) -> bool:
         """
         Reboot GS728TPP via XML API.
@@ -862,6 +899,14 @@ Examples:
 
     if not args.quiet:
         logger.info("Certificate uploaded successfully")
+
+    # Enable HTTPS for GS728TPP (required for port 443 to be active)
+    if isinstance(updater, GS728TPPUpdater):
+        if not args.quiet:
+            logger.info("Enabling HTTPS admin mode...")
+        if not updater.enable_https():
+            logger.error("Failed to enable HTTPS - certificate may be uploaded but HTTPS not active")
+            sys.exit(2)
 
     # Handle reboot if requested
     if args.reboot:
