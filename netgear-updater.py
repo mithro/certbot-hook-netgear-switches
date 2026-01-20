@@ -157,6 +157,7 @@ class GS728TPPUpdater(NetgearSwitchUpdater):
         Upload certificate to GS728TPP via XML API.
 
         Posts XML to /wcd endpoint with certificate data.
+        The switch requires keys in traditional RSA format (PKCS#1).
         """
         if not self.base_url:
             self.logger.error("Not logged in - call login() first")
@@ -169,8 +170,14 @@ class GS728TPPUpdater(NetgearSwitchUpdater):
         with open(key_file, 'r') as f:
             key_data = f.read().strip()
 
-        # Build XML payload (public_key is optional)
-        xml_payload = self._build_cert_xml(cert_data, "", key_data)
+        # Convert keys to traditional RSA format (PKCS#1) as required by switch
+        private_key_rsa, public_key_rsa = self._convert_to_rsa_format(key_data)
+        if not private_key_rsa:
+            self.logger.error("Failed to convert private key to RSA format")
+            return False
+
+        # Build XML payload with all three components
+        xml_payload = self._build_cert_xml(cert_data, public_key_rsa, private_key_rsa)
         self.logger.debug(f"XML payload length: {len(xml_payload)}")
 
         # POST to wcd endpoint
@@ -213,6 +220,52 @@ class GS728TPPUpdater(NetgearSwitchUpdater):
             return False
 
         return True
+
+    def _convert_to_rsa_format(self, key_pem: str) -> tuple:
+        """
+        Convert private key to traditional RSA format (PKCS#1) and extract public key.
+
+        Returns (private_key_rsa, public_key_rsa) tuple, or (None, None) on failure.
+        """
+        import subprocess
+        import tempfile
+
+        try:
+            # Write key to temp file for openssl
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.pem', delete=False) as f:
+                f.write(key_pem)
+                key_file = f.name
+
+            try:
+                # Convert to traditional RSA private key format
+                result = subprocess.run(
+                    ['openssl', 'rsa', '-in', key_file, '-traditional'],
+                    capture_output=True, text=True, timeout=10
+                )
+                if result.returncode != 0:
+                    self.logger.error(f"openssl rsa conversion failed: {result.stderr}")
+                    return (None, None)
+                private_key_rsa = result.stdout.strip()
+
+                # Extract RSA public key
+                result = subprocess.run(
+                    ['openssl', 'rsa', '-in', key_file, '-RSAPublicKey_out'],
+                    capture_output=True, text=True, timeout=10
+                )
+                if result.returncode != 0:
+                    self.logger.error(f"openssl RSAPublicKey extraction failed: {result.stderr}")
+                    return (None, None)
+                public_key_rsa = result.stdout.strip()
+
+                return (private_key_rsa, public_key_rsa)
+
+            finally:
+                import os
+                os.unlink(key_file)
+
+        except Exception as e:
+            self.logger.error(f"Key conversion failed: {e}")
+            return (None, None)
 
     def _build_cert_xml(self, certificate: str, public_key: str, private_key: str) -> str:
         """Build XML payload for certificate import."""
