@@ -74,6 +74,75 @@ class NetgearSwitchUpdater:
         """Log out of the switch web interface."""
         pass  # Optional, not all switches require explicit logout
 
+    def verify_certificate(self, cert_file: str) -> bool:
+        """
+        Verify the switch is serving the expected certificate via HTTPS.
+
+        Connects to the switch on port 443 and compares the served certificate's
+        fingerprint with the expected certificate.
+        """
+        import ssl
+        import socket
+        import hashlib
+
+        # Get expected certificate fingerprint
+        try:
+            with open(cert_file, 'rb') as f:
+                cert_pem = f.read()
+            # Extract first certificate from chain (if fullchain)
+            cert_pem_str = cert_pem.decode('utf-8')
+            if '-----BEGIN CERTIFICATE-----' in cert_pem_str:
+                first_cert_start = cert_pem_str.find('-----BEGIN CERTIFICATE-----')
+                first_cert_end = cert_pem_str.find('-----END CERTIFICATE-----') + len('-----END CERTIFICATE-----')
+                first_cert_pem = cert_pem_str[first_cert_start:first_cert_end].encode('utf-8')
+            else:
+                first_cert_pem = cert_pem
+
+            # Convert PEM to DER to get fingerprint
+            import subprocess
+            result = subprocess.run(
+                ['openssl', 'x509', '-outform', 'DER'],
+                input=first_cert_pem, capture_output=True, timeout=10
+            )
+            if result.returncode != 0:
+                self.logger.error(f"Failed to convert certificate to DER: {result.stderr.decode()}")
+                return False
+            expected_fingerprint = hashlib.sha256(result.stdout).hexdigest()
+            self.logger.debug(f"Expected certificate fingerprint: {expected_fingerprint}")
+        except Exception as e:
+            self.logger.error(f"Failed to read expected certificate: {e}")
+            return False
+
+        # Connect to switch and get served certificate
+        try:
+            url_parts = urlparse(self.switch_url)
+            hostname = url_parts.hostname
+            port = 443
+
+            context = ssl.create_default_context()
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+
+            with socket.create_connection((hostname, port), timeout=REQUEST_TIMEOUT) as sock:
+                with context.wrap_socket(sock, server_hostname=hostname) as ssock:
+                    cert_der = ssock.getpeercert(binary_form=True)
+                    served_fingerprint = hashlib.sha256(cert_der).hexdigest()
+                    self.logger.debug(f"Served certificate fingerprint: {served_fingerprint}")
+
+            if served_fingerprint == expected_fingerprint:
+                self.logger.info("Certificate verification successful - switch is serving the uploaded certificate")
+                return True
+            else:
+                self.logger.warning(f"Certificate mismatch - switch may need a reboot to activate new certificate")
+                self.logger.debug(f"Expected: {expected_fingerprint}")
+                self.logger.debug(f"Got: {served_fingerprint}")
+                return False
+
+        except Exception as e:
+            self.logger.warning(f"Could not verify certificate via HTTPS: {e}")
+            self.logger.warning("HTTPS may not be enabled or switch may need a reboot")
+            return False
+
 
 class GS728TPPUpdater(NetgearSwitchUpdater):
     """
@@ -386,15 +455,18 @@ class S3300Updater(NetgearSwitchUpdater):
             return False
 
         self.logger.debug(f"Upload response status: {resp.status_code}")
-        self.logger.debug(f"Upload response: {resp.text[:500] if resp.text else 'empty'}")
+        # Force UTF-8 encoding - the switch may return non-standard encoding
+        resp.encoding = 'utf-8'
+        response_text = resp.text if resp.text else ''
+        self.logger.debug(f"Upload response: {response_text[:500] if response_text else 'empty'}")
 
         if resp.status_code != 200:
             self.logger.error(f"Upload failed with status {resp.status_code}")
             return False
 
         # Check for success indicators
-        if 'error' in resp.text.lower() and 'no error' not in resp.text.lower():
-            self.logger.error(f"Upload returned error: {resp.text}")
+        if 'error' in response_text.lower() and 'no error' not in response_text.lower():
+            self.logger.error(f"Upload returned error: {response_text}")
             return False
 
         return True
@@ -594,10 +666,18 @@ Examples:
 
     if not args.quiet:
         logger.info("Certificate uploaded successfully")
-        logger.info("")
-        logger.info("NOTE: You may need to:")
-        logger.info("  1. Enable HTTPS in the switch configuration")
-        logger.info("  2. Reboot the switch for changes to take effect")
+
+    # Verify the certificate is now being served
+    if not args.quiet:
+        logger.info("Verifying certificate deployment...")
+    verified = updater.verify_certificate(args.cert_file)
+
+    if not args.quiet:
+        if not verified:
+            logger.info("")
+            logger.info("NOTE: You may need to:")
+            logger.info("  1. Enable HTTPS in the switch configuration")
+            logger.info("  2. Reboot the switch for changes to take effect")
 
 
 if __name__ == "__main__":
