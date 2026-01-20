@@ -546,14 +546,37 @@ class S3300Updater(NetgearSwitchUpdater):
 
         upload_url = f"{self.switch_url}/http_file_download.html/a1"
 
-        # Build multipart form
+        # Build multipart form with correct S3300 field names
+        # The file field is named '.v_1_3_1_handle'
         files = {
-            'file': ('certificate.pem', combined_pem, 'application/octet-stream')
+            '.v_1_3_1_handle': ('certificate.pem', combined_pem, 'application/octet-stream')
         }
 
-        # File type selector value for SSL Server Certificate PEM
+        # Form data must match the S3300 web interface structure
+        # v_1_1_2 is the file type selector (not file_type)
         data = {
-            'file_type': '6'  # SSL Server Certificate PEM File
+            'v_1_1_3': 'HTTP',
+            'v_1_1_2': 'SSL Server Certificate PEM File',
+            'v_1_2_1': '',
+            'v_1_3_2': ' not in progress',
+            'v_1_3_3': '',
+            'v_1_3_4': '',
+            'v_1_9_1': 'image1',
+            'v_1_9_5': '',
+            'v_1_9_2': '1',
+            'v_1_9_3': 'Enable',
+            'v_1_19_1': '32',
+            'v_1_20_1': '',
+            'v_1_200_1': '',
+            'v_2_3_1': ' not in progress',
+            'v_2_4_3': 'None',
+            'v_2_4_2': ' not in progress',
+            'v_4_1_1': '',
+            'submit_flag': '8',  # Set by onclickSubmit() when APPLY clicked
+            'submit_target': 'http_file_download.html',
+            'err_flag': '0',
+            'err_msg': '',
+            'clazz_information': 'http_file_download.html',
         }
 
         try:
@@ -561,7 +584,7 @@ class S3300Updater(NetgearSwitchUpdater):
                 upload_url,
                 files=files,
                 data=data,
-                timeout=REQUEST_TIMEOUT * 2
+                timeout=REQUEST_TIMEOUT * 3  # Certificate uploads can take longer
             )
         except requests.RequestException as e:
             self.logger.error(f"Certificate upload request failed: {e}")
