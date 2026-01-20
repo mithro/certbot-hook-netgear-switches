@@ -119,9 +119,12 @@ class NetgearSwitchUpdater:
             hostname = url_parts.hostname
             port = 443
 
-            context = ssl.create_default_context()
+            # Use permissive SSL context for legacy switches with weak ciphers/DH
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
             context.check_hostname = False
             context.verify_mode = ssl.CERT_NONE
+            # Allow legacy renegotiation and weak DH for old switches
+            context.set_ciphers('DEFAULT:@SECLEVEL=0')
 
             with socket.create_connection((hostname, port), timeout=REQUEST_TIMEOUT) as sock:
                 with context.wrap_socket(sock, server_hostname=hostname) as ssock:
@@ -133,14 +136,14 @@ class NetgearSwitchUpdater:
                 self.logger.info("Certificate verification successful - switch is serving the uploaded certificate")
                 return True
             else:
-                self.logger.warning(f"Certificate mismatch - switch may need a reboot to activate new certificate")
-                self.logger.debug(f"Expected: {expected_fingerprint}")
-                self.logger.debug(f"Got: {served_fingerprint}")
+                self.logger.error(f"Certificate mismatch - switch is not serving the uploaded certificate")
+                self.logger.error(f"Expected fingerprint: {expected_fingerprint}")
+                self.logger.error(f"Served fingerprint:   {served_fingerprint}")
                 return False
 
         except Exception as e:
-            self.logger.warning(f"Could not verify certificate via HTTPS: {e}")
-            self.logger.warning("HTTPS may not be enabled or switch may need a reboot")
+            self.logger.error(f"Could not verify certificate via HTTPS: {e}")
+            self.logger.error("Ensure HTTPS is enabled on the switch")
             return False
 
 
@@ -670,14 +673,9 @@ Examples:
     # Verify the certificate is now being served
     if not args.quiet:
         logger.info("Verifying certificate deployment...")
-    verified = updater.verify_certificate(args.cert_file)
-
-    if not args.quiet:
-        if not verified:
-            logger.info("")
-            logger.info("NOTE: You may need to:")
-            logger.info("  1. Enable HTTPS in the switch configuration")
-            logger.info("  2. Reboot the switch for changes to take effect")
+    if not updater.verify_certificate(args.cert_file):
+        logger.error("Certificate verification failed")
+        sys.exit(2)
 
 
 if __name__ == "__main__":
