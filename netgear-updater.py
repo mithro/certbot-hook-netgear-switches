@@ -597,23 +597,27 @@ class S3300Updater(NetgearSwitchUpdater):
         reboot_url = f"{self.switch_url}/deviceReboot.html/a1"
 
         # Form data to trigger reboot - mimics the web interface form submission
-        data = {
-            'v_1_1_1_extn': '',
-            'v_1_1_1': 'All',  # Reboot all units
-            'v_1_1_2': '2',
-            'v_1_1_3': '1',
-            'v_1_2_1': 'on',  # Enable reboot (checkbox checked)
-            'v_1_3_3': '',
-            'v_1_3_31': '',
-            'v_2_1_1': '',
-            'submit_flag': '0',
-            'submit_target': 'deviceReboot.html',
-            'err_flag': '0',
-            'err_msg': '',
-            'clazz_information': 'deviceReboot.html',
-            'v_1_3_2': 'CANCEL',
-            'v_1_3_1': 'APPLY',
-        }
+        # The submit_flag=8 is set by JavaScript onclickSubmit() when APPLY is clicked
+        # Multiple values for same key are sent as lists (hidden + checkbox/select)
+        data = [
+            ('v_1_1_1_extn', ''),
+            ('v_1_1_1', 'All'),  # Hidden field
+            ('v_1_1_1', 'All'),  # Select field - both sent
+            ('v_1_1_2', '2'),
+            ('v_1_1_3', '1'),
+            ('v_1_2_1', 'Disable'),  # Hidden field
+            ('v_1_2_1', 'on'),  # Checkbox - both sent when checked
+            ('v_1_3_3', ''),
+            ('v_1_3_31', ''),
+            ('v_2_1_1', ''),
+            ('submit_flag', '8'),  # Set by onclickSubmit() - 8 for APPLY button
+            ('submit_target', 'deviceReboot.html'),
+            ('err_flag', '0'),
+            ('err_msg', ''),
+            ('clazz_information', 'deviceReboot.html'),
+            ('v_1_3_2', 'CANCEL'),
+            ('v_1_3_1', 'APPLY'),
+        ]
 
         try:
             self.logger.info("Sending reboot command...")
