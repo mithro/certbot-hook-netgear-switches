@@ -198,7 +198,17 @@ class GS728TPPUpdater(NetgearSwitchUpdater):
             return False
 
         # Check response for errors
-        if '<error>' in resp.text.lower():
+        # The switch returns XML with <statusCode>0</statusCode> for success
+        # and non-zero statusCode with <statusString> for errors
+        status_match = re.search(r'<statusCode>(\d+)</statusCode>', resp.text)
+        if status_match:
+            status_code = int(status_match.group(1))
+            if status_code != 0:
+                status_string_match = re.search(r'<statusString>([^<]*)</statusString>', resp.text)
+                status_string = status_string_match.group(1) if status_string_match else "Unknown error"
+                self.logger.error(f"Upload failed: {status_string} (statusCode={status_code})")
+                return False
+        elif '<error>' in resp.text.lower():
             self.logger.error(f"Upload returned error: {resp.text}")
             return False
 
