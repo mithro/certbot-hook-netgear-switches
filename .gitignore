@@ -1,6 +1,9 @@
 # Temporary exploration files
 .tmp/
 
+# Deploy hooks contain passwords - never commit
+deploy-hooks/
+
 # Claude Code session data
 .claude/
 
