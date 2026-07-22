@@ -938,18 +938,31 @@ def detect_switch_model(switch_url: str) -> str:
     return "unknown"
 
 
-def create_updater(switch_url: str, username: str, password: str,
-                   model: str = None) -> NetgearSwitchUpdater:
-    """Create the appropriate updater for the switch model."""
+def create_updater(switch_url, username, password, model=None, *,
+                   scp_source=None, scp_password=None, staging_dir=None):
     if model is None:
         model = detect_switch_model(switch_url)
+    m = model.upper()
 
-    model_upper = model.upper()
+    fastpath_key = None
+    if m.startswith("M4300-24X"):
+        fastpath_key = "M4300-24X"
+    elif m.startswith("M4300-16X") or m == "M4300":
+        fastpath_key = "M4300-16X"
+    elif m.startswith("GSM7252PS"):
+        fastpath_key = "GSM7252PS"
 
-    if model_upper == "GS728TPP":
+    if fastpath_key:
+        if not (scp_source and scp_password and staging_dir):
+            raise ValueError("FASTPATH deploy needs scp_source/scp_password/staging_dir")
+        return FastpathScpUpdater(
+            switch_url, username, password, model_key=fastpath_key,
+            scp_source=scp_source, scp_password=scp_password, staging_dir=staging_dir)
+
+    if m == "GS728TPP":
         return GS728TPPUpdater(switch_url, username, password)
-    elif model_upper in ("S3300", "S3300-28X", "S3300-52X",
-                         "S3300-28X-POE", "S3300-52X-POE", "S3300-52X-POE+"):
+    if m in ("S3300", "S3300-28X", "S3300-52X", "S3300-28X-POE",
+             "S3300-52X-POE", "S3300-52X-POE+"):
         return S3300Updater(switch_url, username, password)
 
     raise ValueError(f"Unknown or unsupported switch model: {model}")
