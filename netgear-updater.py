@@ -749,6 +749,115 @@ class S3300Updater(HttpUpdater):
         return False
 
 
+class FastpathScpUpdater(NetgearSwitchUpdater):
+    """Deploy a cert to a Netgear FASTPATH switch (M4300, GSM7252PS) over SSH.
+
+    Pulls the cert+key file into nvram:sslpem-server via the switch's
+    `copy scp://<switchcert>@ten64/...` command, then reloads HTTPS in place.
+    Never reboots.
+    """
+
+    PROMPT = r"\([^)\r\n]{1,64}\)\s*[>#]"
+    CONFIRM = r"\(y/n\)"
+
+    def __init__(self, switch_url, username, password, *, model_key,
+                 scp_source, scp_password, staging_dir):
+        super().__init__(switch_url, username, password)
+        if model_key not in MODEL_PROFILES:
+            raise ValueError(f"Unknown FASTPATH model: {model_key}")
+        self.model_key = model_key
+        self.profile = MODEL_PROFILES[model_key]
+        self.scp_source = scp_source            # "switchcert@10.1.5.1:2222"
+        self.scp_password = scp_password
+        self.staging_dir = staging_dir
+        self.host = urlparse(self.switch_url).hostname
+        self.child = None
+
+    # --- pure helpers -----------------------------------------------------
+    def _source_url(self, filename: str) -> str:
+        # absolute staging path so FASTPATH's scp requests the exact path the
+        # ForceCommand wrapper authorises (no home-relative ambiguity)
+        return f"scp://{self.scp_source}{self.staging_dir}/{filename}"
+
+    def reboot(self) -> bool:
+        raise RuntimeError("FastpathScpUpdater never reboots (backbone-safe)")
+
+    # --- pexpect session --------------------------------------------------
+    def login(self) -> bool:
+        import pexpect
+        opts = fastpath_ssh_opts(self.profile["crypto"]) + ["-tt"]
+        self.child = pexpect.spawn(
+            "ssh", opts + [f"{self.username}@{self.host}"],
+            encoding="utf-8", timeout=45)
+        self.child.expect(r"[Pp]assword:")
+        self.child.sendline(self.password)
+        self.child.expect(self.PROMPT)
+        self.child.sendline("enable")
+        idx = self.child.expect([r"[Pp]assword:", self.PROMPT])
+        if idx == 0:
+            self.child.sendline(self.password)
+            self.child.expect(self.PROMPT)
+        self.child.sendline("terminal length 0")
+        self.child.expect(self.PROMPT)
+        return True
+
+    def _send_copy(self, filename: str, dest: str) -> None:
+        """Issue one `copy scp://.../<filename> <dest>` and drive its prompts."""
+        cmd = fastpath_copy_cmd(self._source_url(filename), dest)
+        self.child.sendline(cmd)
+        # FASTPATH may (a) prompt host-key TOFU, (b) prompt remote password,
+        # (c) ask (y/n) to overwrite, then (d) return to prompt.
+        import pexpect
+        for _ in range(8):
+            idx = self.child.expect([
+                r"host key.*\?|continue connecting.*\?|\(yes/no.*\)",  # 0 TOFU
+                r"[Pp]assword:",                                        # 1 remote pw
+                self.CONFIRM,                                           # 2 (y/n)
+                r"Transfer.*complete|copy.*complete|File transfer.*",   # 3 success
+                self.PROMPT,                                            # 4 prompt
+            ], timeout=90)
+            if idx == 0:
+                self.child.sendline("yes")
+            elif idx == 1:
+                self.child.sendline(self.scp_password)
+            elif idx == 2:
+                self.child.send("y")
+            elif idx == 3:
+                self.child.expect(self.PROMPT)
+                return
+            else:  # PROMPT reached
+                return
+        raise RuntimeError(f"copy did not complete: {dest}")
+
+    def upload_certificate(self, cert_file, key_file, chain_file=None) -> bool:
+        # staging is written by the caller (main); here we drive the switch.
+        base = f"{self.model_key.lower()}-{self.host}"
+        self._send_copy(f"{base}-server.pem", "nvram:sslpem-server")
+        if chain_file is not None:
+            self._send_copy(f"{base}-root.pem", "nvram:sslpem-root")
+        for line in secure_server_reload(self.profile["secure_server_mode"]):
+            self.child.sendline(line)
+            self.child.expect(self.PROMPT)
+        # persist; GSM confirm timeout is tiny -> stuff y
+        self.child.sendline("write memory")
+        idx = self.child.expect([self.CONFIRM, self.PROMPT])
+        if idx == 0:
+            self.child.send("y")
+            self.child.expect(self.PROMPT)
+        return True
+
+    def logout(self) -> None:
+        if self.child is not None:
+            try:
+                self.child.sendline("quit")
+                self.child.close()
+            except Exception:
+                pass
+
+    def verify(self, cert_file: str) -> bool:
+        return self.verify_certificate(cert_file, https_port=self.profile["verify_port"])
+
+
 def parse_cert_info(pem_file: str) -> dict:
     """Parse certificate info: expiry date and key type."""
     try:

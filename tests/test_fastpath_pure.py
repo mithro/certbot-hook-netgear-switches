@@ -38,3 +38,34 @@ def test_reload_exec(mod):
 def test_reload_config(mod):
     assert mod.secure_server_reload("config") == [
         "configure", "no ip http secure-server", "ip http secure-server", "exit"]
+
+
+def test_fastpath_construct(mod):
+    u = mod.FastpathScpUpdater(
+        "http://10.1.5.22", "admin", "pw",
+        model_key="GSM7252PS",
+        scp_source="switchcert@10.1.5.1:2222",
+        scp_password="s3cr3t",
+        staging_dir="/var/lib/switchcert/staging",
+    )
+    assert u.profile["verify_port"] == 443
+    assert u.host == "10.1.5.22"
+
+
+def test_fastpath_reboot_refused(mod):
+    u = mod.FastpathScpUpdater(
+        "http://10.1.5.13", "admin", "pw", model_key="M4300-24X",
+        scp_source="switchcert@10.1.5.1:2222", scp_password="x",
+        staging_dir="/tmp")
+    import pytest
+    with pytest.raises(RuntimeError):
+        u.reboot()
+
+
+def test_fastpath_source_url(mod):
+    u = mod.FastpathScpUpdater(
+        "http://10.1.5.13", "admin", "pw", model_key="M4300-24X",
+        scp_source="switchcert@10.1.5.1:2222", scp_password="x",
+        staging_dir="/var/lib/switchcert/staging")
+    assert u._source_url("abc-server.pem") == \
+        "scp://switchcert@10.1.5.1:2222/var/lib/switchcert/staging/abc-server.pem"
