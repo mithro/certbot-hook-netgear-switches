@@ -6,7 +6,9 @@ def test_profiles_present(mod):
     assert mod.MODEL_PROFILES["M4300-16X"]["verify_port"] == 49152
     assert mod.MODEL_PROFILES["GSM7252PS"]["crypto"] == "legacy"
     assert mod.MODEL_PROFILES["M4300-24X"]["secure_server_mode"] == "exec"
-    assert mod.MODEL_PROFILES["GSM7252PS"]["secure_server_mode"] == "config"
+    assert mod.MODEL_PROFILES["GSM7252PS"]["secure_server_mode"] == "exec"
+    assert mod.MODEL_PROFILES["GSM7252PS"]["writemem_stuff"] is True
+    assert mod.MODEL_PROFILES["M4300-24X"]["writemem_stuff"] is False
 
 
 def test_ssh_opts_legacy_has_group14(mod):

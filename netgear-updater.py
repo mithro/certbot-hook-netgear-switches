@@ -52,9 +52,13 @@ requests.packages.urllib3.disable_warnings(
 REQUEST_TIMEOUT = 10.0
 
 MODEL_PROFILES = {
-    "M4300-24X": {"crypto": "modern", "verify_port": 443, "secure_server_mode": "exec"},
-    "M4300-16X": {"crypto": "modern", "verify_port": 49152, "secure_server_mode": "exec"},
-    "GSM7252PS": {"crypto": "legacy", "verify_port": 443, "secure_server_mode": "config"},
+    # secure_server_mode: `ip http secure-server` is EXEC-mode on all these
+    #   Netgear FASTPATH families (verified live on GSM7252PS + M4300).
+    # writemem_stuff: the GSM7252PS `write memory` confirm has a tiny timeout,
+    #   so pre-stuff the `y` in one write; the M4300s use a normal confirm.
+    "M4300-24X": {"crypto": "modern", "verify_port": 443, "secure_server_mode": "exec", "writemem_stuff": False},
+    "M4300-16X": {"crypto": "modern", "verify_port": 49152, "secure_server_mode": "exec", "writemem_stuff": False},
+    "GSM7252PS": {"crypto": "legacy", "verify_port": 443, "secure_server_mode": "exec", "writemem_stuff": True},
 }
 
 # ssh options shared by all FASTPATH targets
@@ -856,7 +860,7 @@ class FastpathScpUpdater(NetgearSwitchUpdater):
             self.child.sendline(line)
             self.child.expect(self.PROMPT)
         # persist
-        if self.profile["secure_server_mode"] == "config":
+        if self.profile["writemem_stuff"]:
             # GSM confirm timeout is tiny — pre-stuff the y before the prompt lands
             self.child.send("write memory\ry\r")
             self.child.expect(self.PROMPT)
