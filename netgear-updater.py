@@ -858,6 +858,30 @@ class FastpathScpUpdater(NetgearSwitchUpdater):
         return self.verify_certificate(cert_file, https_port=self.profile["verify_port"])
 
 
+def stage_server_pem(staging_dir, base, cert_file, key_file, chain_file=None):
+    os.makedirs(staging_dir, exist_ok=True)
+    with open(cert_file, "rb") as f: cert = f.read()
+    with open(key_file, "rb") as f: key = f.read()
+    server = os.path.join(staging_dir, f"{base}-server.pem")
+    with open(server, "wb") as f:
+        f.write(cert)
+        if not cert.endswith(b"\n"): f.write(b"\n")
+        f.write(key)
+    os.chmod(server, 0o400)
+    root = None
+    if chain_file is not None:
+        with open(chain_file, "rb") as f: chain = f.read()
+        root = os.path.join(staging_dir, f"{base}-root.pem")
+        with open(root, "wb") as f: f.write(chain)
+        os.chmod(root, 0o400)
+    return server, root
+
+def cleanup_staging(paths):
+    for p in paths:
+        if p and os.path.exists(p):
+            os.unlink(p)
+
+
 def parse_cert_info(pem_file: str) -> dict:
     """Parse certificate info: expiry date and key type."""
     try:
@@ -968,7 +992,7 @@ def create_updater(switch_url, username, password, model=None, *,
     raise ValueError(f"Unknown or unsupported switch model: {model}")
 
 
-def main():
+def build_parser():
     parser = argparse.ArgumentParser(
         description='Upload SSL certificates to Netgear managed switches',
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1007,6 +1031,17 @@ Examples:
                         help='Suppress output on success')
     parser.add_argument('--debug', action='store_true',
                         help='Enable debug output')
+    parser.add_argument('--scp-source', help='switchcert SCP source "user@host:port" (FASTPATH)')
+    parser.add_argument('--scp-password-file', help='file holding the switchcert password (FASTPATH)')
+    parser.add_argument('--staging-dir', default='/var/lib/switchcert/staging',
+                        help='directory the switchcert sshd serves (FASTPATH)')
+    parser.add_argument('--cert-name', help='certbot lineage / cert-name (for logging + base)')
+    parser.add_argument('--chain-file', help='CA chain PEM -> nvram:sslpem-root (FASTPATH, optional)')
+    return parser
+
+
+def main():
+    parser = build_parser()
     args = parser.parse_args()
 
     # Set up logging
@@ -1039,7 +1074,10 @@ Examples:
             args.switch_url,
             args.username,
             args.password,
-            args.model
+            args.model,
+            scp_source=args.scp_source,
+            scp_password=("x" if args.scp_source else None),
+            staging_dir=args.staging_dir,
         )
     except ValueError as e:
         logger.error(str(e))
@@ -1048,6 +1086,29 @@ Examples:
     if not args.quiet:
         model_name = args.model or type(updater).__name__.replace('Updater', '')
         logger.info(f"Connecting to {model_name} at {args.switch_url}...")
+
+    if isinstance(updater, FastpathScpUpdater):
+        scp_password = ""
+        if args.scp_password_file:
+            with open(args.scp_password_file) as f:
+                scp_password = f.read().strip()
+        updater.scp_password = scp_password
+        base = f"{updater.model_key.lower()}-{updater.host}"
+        server, root = stage_server_pem(args.staging_dir, base,
+                                        args.cert_file, args.key_file,
+                                        args.chain_file)
+        try:
+            if not updater.login():
+                logger.error("SSH login failed"); sys.exit(2)
+            updater.upload_certificate(args.cert_file, args.key_file,
+                                       chain_file=root)
+            updater.logout()
+            if not updater.verify(args.cert_file):
+                logger.error("Certificate verification failed"); sys.exit(2)
+        finally:
+            cleanup_staging([server, root])
+        logger.info("Certificate deployed + verified")
+        return
 
     # Login to switch
     if not updater.login():
