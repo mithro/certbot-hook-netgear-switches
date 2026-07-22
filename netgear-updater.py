@@ -50,6 +50,45 @@ requests.packages.urllib3.disable_warnings(
 
 REQUEST_TIMEOUT = 10.0
 
+MODEL_PROFILES = {
+    "M4300-24X": {"crypto": "modern", "verify_port": 443, "secure_server_mode": "exec"},
+    "M4300-16X": {"crypto": "modern", "verify_port": 49152, "secure_server_mode": "exec"},
+    "GSM7252PS": {"crypto": "legacy", "verify_port": 443, "secure_server_mode": "config"},
+}
+
+# ssh options shared by all FASTPATH targets
+_SSH_OPTS_COMMON = [
+    "-o", "PubkeyAuthentication=no",
+    "-o", "StrictHostKeyChecking=accept-new",
+    "-o", "NumberOfPasswordPrompts=1",
+]
+# extra options required to negotiate with the GSM7252PS' OpenSSH 4.3 server
+_SSH_OPTS_LEGACY = [
+    "-o", "HostKeyAlgorithms=+ssh-rsa",
+    "-o", "PubkeyAcceptedAlgorithms=+ssh-rsa",
+    "-o", "KexAlgorithms=+diffie-hellman-group14-sha1,diffie-hellman-group-exchange-sha1",
+    "-o", "Ciphers=+aes256-ctr,aes256-cbc,aes128-cbc",
+    "-o", "MACs=+hmac-sha1",
+]
+
+
+def fastpath_ssh_opts(crypto: str) -> list:
+    opts = list(_SSH_OPTS_COMMON)
+    if crypto == "legacy":
+        opts += _SSH_OPTS_LEGACY
+    return opts
+
+
+def fastpath_copy_cmd(source_url: str, dest: str) -> str:
+    return f"copy {source_url} {dest}"
+
+
+def secure_server_reload(mode: str) -> list:
+    lines = ["no ip http secure-server", "ip http secure-server"]
+    if mode == "config":
+        return ["configure"] + lines + ["exit"]
+    return lines
+
 
 class NetgearSwitchUpdater:
     """Base class for Netgear switch certificate updaters."""
