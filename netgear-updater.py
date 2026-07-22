@@ -61,10 +61,15 @@ MODEL_PROFILES = {
     "GSM7252PS": {"crypto": "legacy", "verify_port": 443, "secure_server_mode": "exec", "writemem_stuff": True},
 }
 
-# ssh options shared by all FASTPATH targets
+# ssh options shared by all FASTPATH targets. Switches regenerate their host
+# keys on firmware updates / factory resets, so we do not pin them (that would
+# block unattended renewal); the connection is on the trusted mgmt VLAN and the
+# end-to-end TLS fingerprint check is the real assurance the cert deployed.
 _SSH_OPTS_COMMON = [
     "-o", "PubkeyAuthentication=no",
-    "-o", "StrictHostKeyChecking=accept-new",
+    "-o", "StrictHostKeyChecking=no",
+    "-o", "UserKnownHostsFile=/dev/null",
+    "-o", "LogLevel=ERROR",
     "-o", "NumberOfPasswordPrompts=1",
 ]
 # extra options required to negotiate with the GSM7252PS' OpenSSH 4.3 server
