@@ -68,6 +68,8 @@ _SSH_OPTS_COMMON = [
     "-o", "NumberOfPasswordPrompts=1",
 ]
 # extra options required to negotiate with the GSM7252PS' OpenSSH 4.3 server
+# (the M4300s use default modern algorithms; ten64's per-host ssh_config KEX
+# restriction for the switch subnet is fixed to be permissive, not legacy-only)
 _SSH_OPTS_LEGACY = [
     "-o", "HostKeyAlgorithms=+ssh-rsa",
     "-o", "PubkeyAcceptedAlgorithms=+ssh-rsa",
