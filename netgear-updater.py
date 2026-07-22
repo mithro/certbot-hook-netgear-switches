@@ -35,6 +35,7 @@ Usage standalone:
 
 import argparse
 import os
+import pwd
 import sys
 import re
 import requests
@@ -771,6 +772,7 @@ class FastpathScpUpdater(NetgearSwitchUpdater):
         self.scp_password = scp_password
         self.staging_dir = staging_dir
         self.host = urlparse(self.switch_url).hostname
+        self.base = f"{self.model_key.lower()}-{self.host}"
         self.child = None
 
     # --- pure helpers -----------------------------------------------------
@@ -789,16 +791,20 @@ class FastpathScpUpdater(NetgearSwitchUpdater):
         self.child = pexpect.spawn(
             "ssh", opts + [f"{self.username}@{self.host}"],
             encoding="utf-8", timeout=45)
-        self.child.expect(r"[Pp]assword:")
-        self.child.sendline(self.password)
-        self.child.expect(self.PROMPT)
-        self.child.sendline("enable")
-        idx = self.child.expect([r"[Pp]assword:", self.PROMPT])
-        if idx == 0:
+        try:
+            self.child.expect(r"[Pp]assword:")
             self.child.sendline(self.password)
             self.child.expect(self.PROMPT)
-        self.child.sendline("terminal length 0")
-        self.child.expect(self.PROMPT)
+            self.child.sendline("enable")
+            idx = self.child.expect([r"[Pp]assword:", self.PROMPT])
+            if idx == 0:
+                self.child.sendline(self.password)
+                self.child.expect(self.PROMPT)
+            self.child.sendline("terminal length 0")
+            self.child.expect(self.PROMPT)
+        except (pexpect.EOF, pexpect.TIMEOUT) as e:
+            self.logger.error(f"SSH login to {self.host} failed (connection/auth error): {e}")
+            return False
         return True
 
     def _send_copy(self, filename: str, dest: str) -> None:
@@ -809,13 +815,17 @@ class FastpathScpUpdater(NetgearSwitchUpdater):
         # (c) ask (y/n) to overwrite, then (d) return to prompt.
         import pexpect
         for _ in range(8):
-            idx = self.child.expect([
-                r"host key.*\?|continue connecting.*\?|\(yes/no.*\)",  # 0 TOFU
-                r"[Pp]assword:",                                        # 1 remote pw
-                self.CONFIRM,                                           # 2 (y/n)
-                r"Transfer.*complete|copy.*complete|File transfer.*",   # 3 success
-                self.PROMPT,                                            # 4 prompt
-            ], timeout=90)
+            try:
+                idx = self.child.expect([
+                    r"host key.*\?|continue connecting.*\?|\(yes/no.*\)",  # 0 TOFU
+                    r"[Pp]assword:",                                        # 1 remote pw
+                    self.CONFIRM,                                           # 2 (y/n)
+                    r"Transfer.*complete|copy.*complete|File transfer.*",   # 3 success
+                    self.PROMPT,                                            # 4 prompt
+                ], timeout=90)
+            except (pexpect.EOF, pexpect.TIMEOUT) as e:
+                self.logger.error(f"copy transfer for {dest} died: {e}")
+                raise RuntimeError(f"copy failed for {dest}")
             if idx == 0:
                 self.child.sendline("yes")
             elif idx == 1:
@@ -831,19 +841,23 @@ class FastpathScpUpdater(NetgearSwitchUpdater):
 
     def upload_certificate(self, cert_file, key_file, chain_file=None) -> bool:
         # staging is written by the caller (main); here we drive the switch.
-        base = f"{self.model_key.lower()}-{self.host}"
-        self._send_copy(f"{base}-server.pem", "nvram:sslpem-server")
+        self._send_copy(f"{self.base}-server.pem", "nvram:sslpem-server")
         if chain_file is not None:
-            self._send_copy(f"{base}-root.pem", "nvram:sslpem-root")
+            self._send_copy(f"{self.base}-root.pem", "nvram:sslpem-root")
         for line in secure_server_reload(self.profile["secure_server_mode"]):
             self.child.sendline(line)
             self.child.expect(self.PROMPT)
-        # persist; GSM confirm timeout is tiny -> stuff y
-        self.child.sendline("write memory")
-        idx = self.child.expect([self.CONFIRM, self.PROMPT])
-        if idx == 0:
-            self.child.send("y")
+        # persist
+        if self.profile["secure_server_mode"] == "config":
+            # GSM confirm timeout is tiny — pre-stuff the y before the prompt lands
+            self.child.send("write memory\ry\r")
             self.child.expect(self.PROMPT)
+        else:
+            self.child.sendline("write memory")
+            idx = self.child.expect([self.CONFIRM, self.PROMPT])
+            if idx == 0:
+                self.child.send("y")
+                self.child.expect(self.PROMPT)
         return True
 
     def logout(self) -> None:
@@ -858,8 +872,12 @@ class FastpathScpUpdater(NetgearSwitchUpdater):
         return self.verify_certificate(cert_file, https_port=self.profile["verify_port"])
 
 
-def stage_server_pem(staging_dir, base, cert_file, key_file, chain_file=None):
+def stage_server_pem(staging_dir, base, cert_file, key_file, chain_file=None, owner=None):
     os.makedirs(staging_dir, exist_ok=True)
+    uid = gid = None
+    if owner is not None:
+        pw = pwd.getpwnam(owner)
+        uid, gid = pw.pw_uid, pw.pw_gid
     with open(cert_file, "rb") as f: cert = f.read()
     with open(key_file, "rb") as f: key = f.read()
     server = os.path.join(staging_dir, f"{base}-server.pem")
@@ -868,12 +886,16 @@ def stage_server_pem(staging_dir, base, cert_file, key_file, chain_file=None):
         if not cert.endswith(b"\n"): f.write(b"\n")
         f.write(key)
     os.chmod(server, 0o400)
+    if owner is not None:
+        os.chown(server, uid, gid)
     root = None
     if chain_file is not None:
         with open(chain_file, "rb") as f: chain = f.read()
         root = os.path.join(staging_dir, f"{base}-root.pem")
         with open(root, "wb") as f: f.write(chain)
         os.chmod(root, 0o400)
+        if owner is not None:
+            os.chown(root, uid, gid)
     return server, root
 
 def cleanup_staging(paths):
@@ -1092,11 +1114,13 @@ def main():
         if args.scp_password_file:
             with open(args.scp_password_file) as f:
                 scp_password = f.read().strip()
+        if not scp_password:
+            logger.error("FASTPATH deploy requires --scp-password-file with non-empty content")
+            sys.exit(2)
         updater.scp_password = scp_password
-        base = f"{updater.model_key.lower()}-{updater.host}"
-        server, root = stage_server_pem(args.staging_dir, base,
+        server, root = stage_server_pem(args.staging_dir, updater.base,
                                         args.cert_file, args.key_file,
-                                        args.chain_file)
+                                        args.chain_file, owner="switchcert")
         try:
             if not updater.login():
                 logger.error("SSH login failed"); sys.exit(2)
