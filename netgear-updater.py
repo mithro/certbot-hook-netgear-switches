@@ -222,6 +222,13 @@ class NetgearSwitchUpdater:
             context.verify_mode = ssl.CERT_NONE
             # Allow legacy renegotiation and weak DH for old switches
             context.set_ciphers('DEFAULT:@SECLEVEL=0')
+            # The GSM7252PS only offers TLS1.0/SSL3 and lacks RFC5746 secure
+            # renegotiation; allow both so we can read its served cert.
+            try:
+                context.minimum_version = ssl.TLSVersion.TLSv1
+            except (ValueError, OSError):
+                pass
+            context.options |= getattr(ssl, "OP_LEGACY_SERVER_CONNECT", 0x4)
 
             with socket.create_connection((hostname, port), timeout=REQUEST_TIMEOUT) as sock:
                 with context.wrap_socket(sock, server_hostname=hostname) as ssock:
