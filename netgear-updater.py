@@ -58,8 +58,6 @@ class NetgearSwitchUpdater:
         self.switch_url = switch_url.rstrip('/')
         self.username = username
         self.password = password
-        self.session = requests.Session()
-        self.session.verify = False
         self.logger = logging.getLogger(self.__class__.__name__)
 
     def login(self) -> bool:
@@ -129,7 +127,7 @@ class NetgearSwitchUpdater:
         self.logger.error(f"Switch did not come back online within {timeout}s")
         return False
 
-    def verify_certificate(self, cert_file: str) -> bool:
+    def verify_certificate(self, cert_file: str, https_port: int = 443) -> bool:
         """
         Verify the switch is serving the expected certificate via HTTPS.
 
@@ -172,7 +170,7 @@ class NetgearSwitchUpdater:
         try:
             url_parts = urlparse(self.switch_url)
             hostname = url_parts.hostname
-            port = 443
+            port = https_port
 
             # Use permissive SSL context for legacy switches with weak ciphers/DH
             context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
@@ -202,7 +200,16 @@ class NetgearSwitchUpdater:
             return False
 
 
-class GS728TPPUpdater(NetgearSwitchUpdater):
+class HttpUpdater(NetgearSwitchUpdater):
+    """Base for switches driven over the HTTP web UI (requests.Session)."""
+
+    def __init__(self, switch_url: str, username: str, password: str):
+        super().__init__(switch_url, username, password)
+        self.session = requests.Session()
+        self.session.verify = False
+
+
+class GS728TPPUpdater(HttpUpdater):
     """
     Certificate updater for GS728TPP ProSafe Smart Switch.
 
@@ -512,7 +519,7 @@ class GS728TPPUpdater(NetgearSwitchUpdater):
         return True
 
 
-class S3300Updater(NetgearSwitchUpdater):
+class S3300Updater(HttpUpdater):
     """
     Certificate updater for S3300 series switches.
 
