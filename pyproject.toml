@@ -1,0 +1,13 @@
+[project]
+name = "certbot-hook-netgear-switches"
+version = "0.1.0"
+description = "Certbot deploy hook: upload LE certs to Netgear switches"
+requires-python = ">=3.11"
+dependencies = [
+    "requests>=2.31",
+    "pexpect>=4.9",
+    "cryptography>=42",
+]
+
+[dependency-groups]
+dev = ["pytest>=8"]
