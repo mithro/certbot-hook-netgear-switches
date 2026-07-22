@@ -78,5 +78,5 @@ def test_fastpath_base_has_no_dots(mod):
         "http://10.1.5.22", "admin", "pw", model_key="GSM7252PS",
         scp_source="switchcert@10.1.5.2", scp_password="x",
         staging_dir="/var/lib/switchcert/staging")
-    assert u.base == "gsm7252ps-10-1-5-22"
+    assert u.base == "10-1-5-22"
     assert "." not in u.base

@@ -772,9 +772,11 @@ class FastpathScpUpdater(NetgearSwitchUpdater):
         self.scp_password = scp_password
         self.staging_dir = staging_dir
         self.host = urlparse(self.switch_url).hostname
-        # FASTPATH's copy-scp URL parser chokes on dots in the filename (same
-        # class of bug as the :port rejection), so sanitise the dotted IP.
-        self.base = f"{self.model_key.lower()}-{self.host}".replace(".", "-")
+        # FASTPATH copy-scp has a short (~55 char) limit on the remote path AND
+        # rejects dots in the filename. Use the dot-sanitised mgmt IP as the
+        # staged base ("10-1-5-22"): dot-free, unique-per-switch, and short
+        # enough (full path stays well under the limit for the mgmt subnet).
+        self.base = self.host.replace(".", "-")
         self.child = None
 
     # --- pure helpers -----------------------------------------------------
