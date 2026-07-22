@@ -14,3 +14,7 @@ def test_create_fastpath(mod, model, port):
 def test_create_still_makes_http(mod):
     u = mod.create_updater("http://10.1.5.14", "admin", "pw", "GS728TPP")
     assert isinstance(u, mod.GS728TPPUpdater)
+
+def test_create_fastpath_missing_scp_args_raises(mod):
+    with pytest.raises(ValueError):
+        mod.create_updater("http://10.1.5.13", "admin", "pw", "M4300-24X")  # no scp_* kwargs
