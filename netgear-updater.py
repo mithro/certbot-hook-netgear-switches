@@ -52,13 +52,11 @@ requests.packages.urllib3.disable_warnings(
 REQUEST_TIMEOUT = 10.0
 
 MODEL_PROFILES = {
-    # secure_server_mode: `ip http secure-server` is EXEC-mode on all these
-    #   Netgear FASTPATH families (verified live on GSM7252PS + M4300).
     # writemem_stuff: the GSM7252PS `write memory` confirm has a tiny timeout,
     #   so pre-stuff the `y` in one write; the M4300s use a normal confirm.
-    "M4300-24X": {"crypto": "modern", "verify_port": 443, "secure_server_mode": "exec", "writemem_stuff": False},
-    "M4300-16X": {"crypto": "modern", "verify_port": 49152, "secure_server_mode": "exec", "writemem_stuff": False},
-    "GSM7252PS": {"crypto": "legacy", "verify_port": 443, "secure_server_mode": "exec", "writemem_stuff": True},
+    "M4300-24X": {"crypto": "modern", "verify_port": 443, "writemem_stuff": False},
+    "M4300-16X": {"crypto": "modern", "verify_port": 49152, "writemem_stuff": False},
+    "GSM7252PS": {"crypto": "legacy", "verify_port": 443, "writemem_stuff": True},
 }
 
 # ssh options shared by all FASTPATH targets. Switches regenerate their host
@@ -93,13 +91,6 @@ def fastpath_ssh_opts(crypto: str) -> list:
 
 def fastpath_copy_cmd(source_url: str, dest: str) -> str:
     return f"copy {source_url} {dest}"
-
-
-def secure_server_reload(mode: str) -> list:
-    lines = ["no ip http secure-server", "ip http secure-server"]
-    if mode == "config":
-        return ["configure"] + lines + ["exit"]
-    return lines
 
 
 class NetgearSwitchUpdater:
@@ -867,12 +858,17 @@ class FastpathScpUpdater(NetgearSwitchUpdater):
 
     def upload_certificate(self, cert_file, key_file, chain_file=None) -> bool:
         # staging is written by the caller (main); here we drive the switch.
+        # FASTPATH refuses the sslpem upload while the HTTP secure-server is
+        # enabled ("HTTP Secure-server must be disabled prior to upgrade"), so
+        # disable -> copy -> re-enable. Re-enabling loads the new cert; no reboot.
+        # (These are EXEC-mode commands on every FASTPATH family here.)
+        self.child.sendline("no ip http secure-server")
+        self.child.expect(self.PROMPT)
         self._send_copy(f"{self.base}-server.pem", "nvram:sslpem-server")
         if chain_file is not None:
             self._send_copy(f"{self.base}-root.pem", "nvram:sslpem-root")
-        for line in secure_server_reload(self.profile["secure_server_mode"]):
-            self.child.sendline(line)
-            self.child.expect(self.PROMPT)
+        self.child.sendline("ip http secure-server")
+        self.child.expect(self.PROMPT)
         # persist
         if self.profile["writemem_stuff"]:
             # GSM confirm timeout is tiny — pre-stuff the y before the prompt lands
