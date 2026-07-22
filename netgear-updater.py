@@ -223,7 +223,12 @@ class NetgearSwitchUpdater:
             # The GSM7252PS only offers TLS1.0/SSL3 and lacks RFC5746 secure
             # renegotiation; allow both so we can read its served cert.
             try:
-                context.minimum_version = ssl.TLSVersion.TLSv1
+                import warnings
+                with warnings.catch_warnings():
+                    # TLSv1 is deprecated but the GSM7252PS only speaks TLS1.0;
+                    # silence the noise so it doesn't look like a renewal error.
+                    warnings.simplefilter("ignore", DeprecationWarning)
+                    context.minimum_version = ssl.TLSVersion.TLSv1
             except (ValueError, OSError):
                 pass
             context.options |= getattr(ssl, "OP_LEGACY_SERVER_CONNECT", 0x4)
