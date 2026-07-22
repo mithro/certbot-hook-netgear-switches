@@ -69,3 +69,14 @@ def test_fastpath_source_url(mod):
         staging_dir="/var/lib/switchcert/staging")
     assert u._source_url("abc-server.pem") == \
         "scp://switchcert@10.1.5.1:2222/var/lib/switchcert/staging/abc-server.pem"
+
+
+def test_fastpath_base_has_no_dots(mod):
+    # FASTPATH copy-scp rejects dots in the staged filename; base must sanitise
+    # the dotted host/IP so the filename is dot-free (except the .pem suffix).
+    u = mod.FastpathScpUpdater(
+        "http://10.1.5.22", "admin", "pw", model_key="GSM7252PS",
+        scp_source="switchcert@10.1.5.2", scp_password="x",
+        staging_dir="/var/lib/switchcert/staging")
+    assert u.base == "gsm7252ps-10-1-5-22"
+    assert "." not in u.base

@@ -772,7 +772,9 @@ class FastpathScpUpdater(NetgearSwitchUpdater):
         self.scp_password = scp_password
         self.staging_dir = staging_dir
         self.host = urlparse(self.switch_url).hostname
-        self.base = f"{self.model_key.lower()}-{self.host}"
+        # FASTPATH's copy-scp URL parser chokes on dots in the filename (same
+        # class of bug as the :port rejection), so sanitise the dotted IP.
+        self.base = f"{self.model_key.lower()}-{self.host}".replace(".", "-")
         self.child = None
 
     # --- pure helpers -----------------------------------------------------
@@ -817,11 +819,12 @@ class FastpathScpUpdater(NetgearSwitchUpdater):
         for _ in range(8):
             try:
                 idx = self.child.expect([
-                    r"host key.*\?|continue connecting.*\?|\(yes/no.*\)",  # 0 TOFU
-                    r"[Pp]assword:",                                        # 1 remote pw
-                    self.CONFIRM,                                           # 2 (y/n)
-                    r"Transfer.*complete|copy.*complete|File transfer.*",   # 3 success
-                    self.PROMPT,                                            # 4 prompt
+                    r"host key.*\?|continue connecting.*\?|\(yes/no.*\)",   # 0 TOFU
+                    r"[Pp]assword:",                                         # 1 remote pw
+                    self.CONFIRM,                                            # 2 (y/n)
+                    r"[Tt]ransfer failed|[Ff]ailed!|% *Error|[Ee]rror during",  # 3 failure
+                    r"bytes transferred|completed successfully|operation completed",  # 4 success
+                    self.PROMPT,                                             # 5 prompt
                 ], timeout=90)
             except (pexpect.EOF, pexpect.TIMEOUT) as e:
                 self.logger.error(f"copy transfer for {dest} died: {e}")
@@ -833,6 +836,9 @@ class FastpathScpUpdater(NetgearSwitchUpdater):
             elif idx == 2:
                 self.child.send("y")
             elif idx == 3:
+                self.logger.error(f"switch reported transfer failure for {dest}")
+                raise RuntimeError(f"copy failed for {dest} (switch reported failure)")
+            elif idx == 4:
                 self.child.expect(self.PROMPT)
                 return
             else:  # PROMPT reached
