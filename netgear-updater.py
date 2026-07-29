@@ -59,6 +59,15 @@ MODEL_PROFILES = {
     "GSM7252PS": {"crypto": "legacy", "verify_port": 443, "writemem_stuff": True},
 }
 
+# Map the hook's FASTPATH model keys to python-netgear-switch-library registry
+# model ids. The SCP cert deploy is delegated to the library, which owns the
+# per-model SSH wire flow keyed by these ids.
+_FASTPATH_LIBRARY_MODEL = {
+    "M4300-24X": "m4300-24x",
+    "M4300-16X": "m4300-16x",
+    "GSM7252PS": "gsm7252ps",
+}
+
 # ssh options shared by all FASTPATH targets. Switches regenerate their host
 # keys on firmware updates / factory resets, so we do not pin them (that would
 # block unattended renewal); the connection is on the trusted mgmt VLAN and the
@@ -602,9 +611,6 @@ class FastpathScpUpdater(NetgearSwitchUpdater):
     Never reboots.
     """
 
-    PROMPT = r"\([^)\r\n]{1,64}\)\s*[>#]"
-    CONFIRM = r"\(y/n\)"
-
     def __init__(self, switch_url, username, password, *, model_key,
                  scp_source, scp_password, staging_dir):
         super().__init__(switch_url, username, password)
@@ -621,7 +627,6 @@ class FastpathScpUpdater(NetgearSwitchUpdater):
         # staged base ("10-1-5-22"): dot-free, unique-per-switch, and short
         # enough (full path stays well under the limit for the mgmt subnet).
         self.base = self.host.replace(".", "-")
-        self.child = None
 
     # --- pure helpers -----------------------------------------------------
     def _source_url(self, filename: str) -> str:
@@ -632,98 +637,45 @@ class FastpathScpUpdater(NetgearSwitchUpdater):
     def reboot(self) -> bool:
         raise RuntimeError("FastpathScpUpdater never reboots (backbone-safe)")
 
-    # --- pexpect session --------------------------------------------------
+    # --- library delegation ----------------------------------------------
     def login(self) -> bool:
-        import pexpect
-        opts = fastpath_ssh_opts(self.profile["crypto"]) + ["-tt"]
-        self.child = pexpect.spawn(
-            "ssh", opts + [f"{self.username}@{self.host}"],
-            encoding="utf-8", timeout=45)
+        # No-op: the library opens (and closes) its own SSH transport inside
+        # upload_certificate_scp, using http_password as the SSH login password.
+        # Kept so main()'s FASTPATH flow (stage -> login -> upload -> logout ->
+        # verify) still runs unchanged.
+        return True
+
+    def upload_certificate(self, cert_file, key_file, chain_file=None) -> bool:
+        """Deploy the staged cert via python-netgear-switch-library.
+
+        Delegates the FASTPATH SSH flow (disable HTTP secure-server -> copy
+        scp sslpem-server [+ sslpem-root] -> re-enable -> write memory) to the
+        library's SyncSwitch.upload_certificate_scp -- the single source of
+        truth for the per-model wire shape. main() still stages the PEM; this
+        never reboots. Returns True on success, False (logged) on any
+        library-side failure."""
+        from netgear_switch import SyncSwitch
+        from netgear_switch.registry import get_model
+
+        model_key = _FASTPATH_LIBRARY_MODEL[self.model_key]
+        host = urlparse(self.switch_url).netloc or self.host
         try:
-            self.child.expect(r"[Pp]assword:")
-            self.child.sendline(self.password)
-            self.child.expect(self.PROMPT)
-            self.child.sendline("enable")
-            idx = self.child.expect([r"[Pp]assword:", self.PROMPT])
-            if idx == 0:
-                self.child.sendline(self.password)
-                self.child.expect(self.PROMPT)
-            self.child.sendline("terminal length 0")
-            self.child.expect(self.PROMPT)
-        except (pexpect.EOF, pexpect.TIMEOUT) as e:
-            self.logger.error(f"SSH login to {self.host} failed (connection/auth error): {e}")
+            SyncSwitch(
+                get_model(model_key), host, http_password=self.password,
+            ).upload_certificate_scp(
+                scp_source=self.scp_source,
+                scp_password=self.scp_password,
+                remote_dir=self.staging_dir,
+                chain=chain_file is not None,
+            )
+        except Exception as exc:  # noqa: BLE001 - surface any library failure as a clean False
+            self.logger.error(f"library SCP cert upload failed for {model_key}: {exc}")
             return False
         return True
 
-    def _send_copy(self, filename: str, dest: str) -> None:
-        """Issue one `copy scp://.../<filename> <dest>` and drive its prompts."""
-        cmd = fastpath_copy_cmd(self._source_url(filename), dest)
-        self.child.sendline(cmd)
-        # FASTPATH may (a) prompt host-key TOFU, (b) prompt remote password,
-        # (c) ask (y/n) to overwrite, then (d) return to prompt.
-        import pexpect
-        for _ in range(8):
-            try:
-                idx = self.child.expect([
-                    r"host key.*\?|continue connecting.*\?|\(yes/no.*\)",   # 0 TOFU
-                    r"[Pp]assword:",                                         # 1 remote pw
-                    self.CONFIRM,                                            # 2 (y/n)
-                    r"[Tt]ransfer failed|[Ff]ailed!|% *Error|[Ee]rror during",  # 3 failure
-                    r"bytes transferred|completed successfully|operation completed",  # 4 success
-                    self.PROMPT,                                             # 5 prompt
-                ], timeout=90)
-            except (pexpect.EOF, pexpect.TIMEOUT) as e:
-                self.logger.error(f"copy transfer for {dest} died: {e}")
-                raise RuntimeError(f"copy failed for {dest}")
-            if idx == 0:
-                self.child.sendline("yes")
-            elif idx == 1:
-                self.child.sendline(self.scp_password)
-            elif idx == 2:
-                self.child.send("y")
-            elif idx == 3:
-                self.logger.error(f"switch reported transfer failure for {dest}")
-                raise RuntimeError(f"copy failed for {dest} (switch reported failure)")
-            elif idx == 4:
-                self.child.expect(self.PROMPT)
-                return
-            else:  # PROMPT reached
-                return
-        raise RuntimeError(f"copy did not complete: {dest}")
-
-    def upload_certificate(self, cert_file, key_file, chain_file=None) -> bool:
-        # staging is written by the caller (main); here we drive the switch.
-        # FASTPATH refuses the sslpem upload while the HTTP secure-server is
-        # enabled ("HTTP Secure-server must be disabled prior to upgrade"), so
-        # disable -> copy -> re-enable. Re-enabling loads the new cert; no reboot.
-        # (These are EXEC-mode commands on every FASTPATH family here.)
-        self.child.sendline("no ip http secure-server")
-        self.child.expect(self.PROMPT)
-        self._send_copy(f"{self.base}-server.pem", "nvram:sslpem-server")
-        if chain_file is not None:
-            self._send_copy(f"{self.base}-root.pem", "nvram:sslpem-root")
-        self.child.sendline("ip http secure-server")
-        self.child.expect(self.PROMPT)
-        # persist
-        if self.profile["writemem_stuff"]:
-            # GSM confirm timeout is tiny — pre-stuff the y before the prompt lands
-            self.child.send("write memory\ry\r")
-            self.child.expect(self.PROMPT)
-        else:
-            self.child.sendline("write memory")
-            idx = self.child.expect([self.CONFIRM, self.PROMPT])
-            if idx == 0:
-                self.child.send("y")
-                self.child.expect(self.PROMPT)
-        return True
-
     def logout(self) -> None:
-        if self.child is not None:
-            try:
-                self.child.sendline("quit")
-                self.child.close()
-            except Exception:
-                pass
+        # No-op: the library owns and closes its own SSH transport.
+        pass
 
     def verify(self, cert_file: str) -> bool:
         return self.verify_certificate(cert_file, https_port=self.profile["verify_port"])
