@@ -7,6 +7,11 @@ dependencies = [
     "requests>=2.31",
     "pexpect>=4.9",
     "cryptography>=42",
+    # HTTP cert-upload flows (S3300 multipart, GS728TPP GoAhead XML-API) are
+    # delegated to the library -- see _upload_cert_via_library in
+    # netgear-updater.py. Requires the release that includes GS728TPP cert
+    # upload (SyncSwitch.upload_certificate for gs728tpp).
+    "python-netgear-switch-library[http]",
 ]
 
 [dependency-groups]

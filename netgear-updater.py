@@ -59,6 +59,15 @@ MODEL_PROFILES = {
     "GSM7252PS": {"crypto": "legacy", "verify_port": 443, "writemem_stuff": True},
 }
 
+# Map the hook's FASTPATH model keys to python-netgear-switch-library registry
+# model ids. The SCP cert deploy is delegated to the library, which owns the
+# per-model SSH wire flow keyed by these ids.
+_FASTPATH_LIBRARY_MODEL = {
+    "M4300-24X": "m4300-24x",
+    "M4300-16X": "m4300-16x",
+    "GSM7252PS": "gsm7252ps",
+}
+
 # ssh options shared by all FASTPATH targets. Switches regenerate their host
 # keys on firmware updates / factory resets, so we do not pin them (that would
 # block unattended renewal); the connection is on the trusted mgmt VLAN and the
@@ -80,6 +89,36 @@ _SSH_OPTS_LEGACY = [
     "-o", "Ciphers=+aes256-ctr,aes256-cbc,aes128-cbc",
     "-o", "MACs=+hmac-sha1",
 ]
+
+
+
+def _upload_cert_via_library(model_key, switch_url, username, password,
+                             cert_file, key_file, logger):
+    """Upload an HTTPS SSL cert by delegating to python-netgear-switch-library.
+
+    The library owns the per-model upload wire flow (S3300 multipart /
+    GS728TPP GoAhead XML-API incl. RSA PKCS#1 conversion), so this hook no
+    longer reimplements it. Returns True on success, False (logged) on any
+    library-side failure. The library performs its own web login; the caller's
+    updater.login() remains for the hook-specific enable_https()/reboot() steps.
+    """
+    from netgear_switch import SyncSwitch
+    from netgear_switch.registry import get_model
+
+    host = urlparse(switch_url).netloc or switch_url
+    with open(cert_file) as fh:
+        cert_pem = fh.read()
+    with open(key_file) as fh:
+        key_pem = fh.read()
+    try:
+        with SyncSwitch(get_model(model_key), host, http_password=password) as sw:
+            # force=True: a certbot renewal DELIBERATELY replaces the running
+            # server cert (that is the whole point of the deploy hook).
+            sw.upload_certificate(cert_pem, key_pem, force=True)
+    except Exception as exc:  # noqa: BLE001 - surface any library failure as a clean False
+        logger.error(f"library cert upload failed for {model_key}: {exc}")
+        return False
+    return True
 
 
 def fastpath_ssh_opts(crypto: str) -> list:
@@ -341,144 +380,16 @@ class GS728TPPUpdater(HttpUpdater):
         return True
 
     def upload_certificate(self, cert_file: str, key_file: str) -> bool:
-        """
-        Upload certificate to GS728TPP via XML API.
+        """Upload the SSL cert via python-netgear-switch-library.
 
-        Posts XML to /wcd endpoint with certificate data.
-        The switch requires keys in traditional RSA format (PKCS#1).
-        """
-        if not self.base_url:
-            self.logger.error("Not logged in - call login() first")
-            return False
+        Delegates the GS728TPP GoAhead XML-API upload (PKCS#1 key conversion +
+        SSLCryptoCertificateImportList POST) to the library's
+        SyncSwitch.upload_certificate. This updater keeps only the hook-specific
+        login()/enable_https()/reboot() orchestration."""
+        return _upload_cert_via_library(
+            "gs728tpp", self.switch_url, self.username, self.password,
+            cert_file, key_file, self.logger)
 
-        # Read certificate and key files
-        with open(cert_file, 'r') as f:
-            cert_data = f.read().strip()
-
-        with open(key_file, 'r') as f:
-            key_data = f.read().strip()
-
-        # Convert keys to traditional RSA format (PKCS#1) as required by switch
-        private_key_rsa, public_key_rsa = self._convert_to_rsa_format(key_data)
-        if not private_key_rsa:
-            self.logger.error("Failed to convert private key to RSA format")
-            return False
-
-        # Build XML payload with all three components
-        xml_payload = self._build_cert_xml(cert_data, public_key_rsa, private_key_rsa)
-        self.logger.debug(f"XML payload length: {len(xml_payload)}")
-
-        # POST to wcd endpoint
-        wcd_url = f"{self.base_url}/wcd"
-        headers = {
-            'Content-Type': 'application/xml; charset=utf-8',
-        }
-
-        try:
-            resp = self.session.post(
-                wcd_url,
-                data=xml_payload,
-                headers=headers,
-                timeout=REQUEST_TIMEOUT * 2
-            )
-        except requests.RequestException as e:
-            self.logger.error(f"Certificate upload request failed: {e}")
-            return False
-
-        self.logger.debug(f"Upload response status: {resp.status_code}")
-        self.logger.debug(f"Upload response: {resp.text[:500] if resp.text else 'empty'}")
-
-        if resp.status_code != 200:
-            self.logger.error(f"Upload failed with status {resp.status_code}")
-            return False
-
-        # Check response for errors
-        # The switch returns XML with <statusCode>0</statusCode> for success
-        # and non-zero statusCode with <statusString> for errors
-        status_match = re.search(r'<statusCode>(\d+)</statusCode>', resp.text)
-        if status_match:
-            status_code = int(status_match.group(1))
-            if status_code != 0:
-                status_string_match = re.search(r'<statusString>([^<]*)</statusString>', resp.text)
-                status_string = status_string_match.group(1) if status_string_match else "Unknown error"
-                self.logger.error(f"Upload failed: {status_string} (statusCode={status_code})")
-                return False
-        elif '<error>' in resp.text.lower():
-            self.logger.error(f"Upload returned error: {resp.text}")
-            return False
-
-        return True
-
-    def _convert_to_rsa_format(self, key_pem: str) -> tuple:
-        """
-        Convert private key to traditional RSA format (PKCS#1) and extract public key.
-
-        Returns (private_key_rsa, public_key_rsa) tuple, or (None, None) on failure.
-        """
-        import subprocess
-        import tempfile
-
-        try:
-            # Write key to temp file for openssl
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.pem', delete=False) as f:
-                f.write(key_pem)
-                key_file = f.name
-
-            try:
-                # Convert to traditional RSA private key format
-                result = subprocess.run(
-                    ['openssl', 'rsa', '-in', key_file, '-traditional'],
-                    capture_output=True, text=True, timeout=10
-                )
-                if result.returncode != 0:
-                    self.logger.error(f"openssl rsa conversion failed: {result.stderr}")
-                    return (None, None)
-                private_key_rsa = result.stdout.strip()
-
-                # Extract RSA public key
-                result = subprocess.run(
-                    ['openssl', 'rsa', '-in', key_file, '-RSAPublicKey_out'],
-                    capture_output=True, text=True, timeout=10
-                )
-                if result.returncode != 0:
-                    self.logger.error(f"openssl RSAPublicKey extraction failed: {result.stderr}")
-                    return (None, None)
-                public_key_rsa = result.stdout.strip()
-
-                return (private_key_rsa, public_key_rsa)
-
-            finally:
-                import os
-                os.unlink(key_file)
-
-        except Exception as e:
-            self.logger.error(f"Key conversion failed: {e}")
-            return (None, None)
-
-    def _build_cert_xml(self, certificate: str, public_key: str, private_key: str) -> str:
-        """Build XML payload for certificate import."""
-        # Escape XML special characters in PEM data
-        def escape_xml(s):
-            return (s.replace('&', '&amp;')
-                     .replace('<', '&lt;')
-                     .replace('>', '&gt;')
-                     .replace('"', '&quot;')
-                     .replace("'", '&apos;'))
-
-        parts = ["<?xml version='1.0' encoding='utf-8'?>"]
-        parts.append("<DeviceConfiguration>")
-        parts.append('<SSLCryptoCertificateImportList action="set">')
-        parts.append("<Entry>")
-        parts.append("<instance>1</instance>")
-        parts.append(f"<certificate>{escape_xml(certificate)}</certificate>")
-        if public_key:
-            parts.append(f"<publicKey>{escape_xml(public_key)}</publicKey>")
-        parts.append(f"<privateKey>{escape_xml(private_key)}</privateKey>")
-        parts.append("</Entry>")
-        parts.append("</SSLCryptoCertificateImportList>")
-        parts.append("</DeviceConfiguration>")
-
-        return ''.join(parts)
 
     def enable_https(self) -> bool:
         """
@@ -623,87 +534,15 @@ class S3300Updater(HttpUpdater):
         return True
 
     def upload_certificate(self, cert_file: str, key_file: str) -> bool:
-        """
-        Upload certificate to S3300 via multipart form.
+        """Upload the SSL cert via python-netgear-switch-library.
 
-        POSTs to /http_file_download.html/a1 with file upload.
-        """
-        if not self.logged_in:
-            self.logger.error("Not logged in - call login() first")
-            return False
-
-        # Read certificate and key files
-        with open(cert_file, 'rb') as f:
-            cert_data = f.read()
-
-        with open(key_file, 'rb') as f:
-            key_data = f.read()
-
-        # S3300 expects PEM file with cert + key combined
-        combined_pem = cert_data + b'\n' + key_data
-
-        upload_url = f"{self.switch_url}/http_file_download.html/a1"
-
-        # Build multipart form with correct S3300 field names
-        # The file field is named '.v_1_3_1_handle'
-        files = {
-            '.v_1_3_1_handle': ('certificate.pem', combined_pem, 'application/octet-stream')
-        }
-
-        # Form data must match the S3300 web interface structure
-        # v_1_1_2 is the file type selector (not file_type)
-        data = {
-            'v_1_1_3': 'HTTP',
-            'v_1_1_2': 'SSL Server Certificate PEM File',
-            'v_1_2_1': '',
-            'v_1_3_2': ' not in progress',
-            'v_1_3_3': '',
-            'v_1_3_4': '',
-            'v_1_9_1': 'image1',
-            'v_1_9_5': '',
-            'v_1_9_2': '1',
-            'v_1_9_3': 'Enable',
-            'v_1_19_1': '32',
-            'v_1_20_1': '',
-            'v_1_200_1': '',
-            'v_2_3_1': ' not in progress',
-            'v_2_4_3': 'None',
-            'v_2_4_2': ' not in progress',
-            'v_4_1_1': '',
-            'submit_flag': '8',  # Set by onclickSubmit() when APPLY clicked
-            'submit_target': 'http_file_download.html',
-            'err_flag': '0',
-            'err_msg': '',
-            'clazz_information': 'http_file_download.html',
-        }
-
-        try:
-            resp = self.session.post(
-                upload_url,
-                files=files,
-                data=data,
-                timeout=REQUEST_TIMEOUT * 3  # Certificate uploads can take longer
-            )
-        except requests.RequestException as e:
-            self.logger.error(f"Certificate upload request failed: {e}")
-            return False
-
-        self.logger.debug(f"Upload response status: {resp.status_code}")
-        # Force UTF-8 encoding - the switch may return non-standard encoding
-        resp.encoding = 'utf-8'
-        response_text = resp.text if resp.text else ''
-        self.logger.debug(f"Upload response: {response_text[:500] if response_text else 'empty'}")
-
-        if resp.status_code != 200:
-            self.logger.error(f"Upload failed with status {resp.status_code}")
-            return False
-
-        # Check for success indicators
-        if 'error' in response_text.lower() and 'no error' not in response_text.lower():
-            self.logger.error(f"Upload returned error: {response_text}")
-            return False
-
-        return True
+        Delegates the S3300 (== gsm7228ps) HTTP multipart upload flow to the
+        library's SyncSwitch.upload_certificate -- the single source of truth
+        for the per-model wire shape. This updater keeps only the hook-specific
+        login()/reboot() orchestration."""
+        return _upload_cert_via_library(
+            "gsm7228ps", self.switch_url, self.username, self.password,
+            cert_file, key_file, self.logger)
 
     def reboot(self) -> bool:
         """
@@ -772,9 +611,6 @@ class FastpathScpUpdater(NetgearSwitchUpdater):
     Never reboots.
     """
 
-    PROMPT = r"\([^)\r\n]{1,64}\)\s*[>#]"
-    CONFIRM = r"\(y/n\)"
-
     def __init__(self, switch_url, username, password, *, model_key,
                  scp_source, scp_password, staging_dir):
         super().__init__(switch_url, username, password)
@@ -791,7 +627,6 @@ class FastpathScpUpdater(NetgearSwitchUpdater):
         # staged base ("10-1-5-22"): dot-free, unique-per-switch, and short
         # enough (full path stays well under the limit for the mgmt subnet).
         self.base = self.host.replace(".", "-")
-        self.child = None
 
     # --- pure helpers -----------------------------------------------------
     def _source_url(self, filename: str) -> str:
@@ -802,98 +637,45 @@ class FastpathScpUpdater(NetgearSwitchUpdater):
     def reboot(self) -> bool:
         raise RuntimeError("FastpathScpUpdater never reboots (backbone-safe)")
 
-    # --- pexpect session --------------------------------------------------
+    # --- library delegation ----------------------------------------------
     def login(self) -> bool:
-        import pexpect
-        opts = fastpath_ssh_opts(self.profile["crypto"]) + ["-tt"]
-        self.child = pexpect.spawn(
-            "ssh", opts + [f"{self.username}@{self.host}"],
-            encoding="utf-8", timeout=45)
+        # No-op: the library opens (and closes) its own SSH transport inside
+        # upload_certificate_scp, using http_password as the SSH login password.
+        # Kept so main()'s FASTPATH flow (stage -> login -> upload -> logout ->
+        # verify) still runs unchanged.
+        return True
+
+    def upload_certificate(self, cert_file, key_file, chain_file=None) -> bool:
+        """Deploy the staged cert via python-netgear-switch-library.
+
+        Delegates the FASTPATH SSH flow (disable HTTP secure-server -> copy
+        scp sslpem-server [+ sslpem-root] -> re-enable -> write memory) to the
+        library's SyncSwitch.upload_certificate_scp -- the single source of
+        truth for the per-model wire shape. main() still stages the PEM; this
+        never reboots. Returns True on success, False (logged) on any
+        library-side failure."""
+        from netgear_switch import SyncSwitch
+        from netgear_switch.registry import get_model
+
+        model_key = _FASTPATH_LIBRARY_MODEL[self.model_key]
+        host = urlparse(self.switch_url).netloc or self.host
         try:
-            self.child.expect(r"[Pp]assword:")
-            self.child.sendline(self.password)
-            self.child.expect(self.PROMPT)
-            self.child.sendline("enable")
-            idx = self.child.expect([r"[Pp]assword:", self.PROMPT])
-            if idx == 0:
-                self.child.sendline(self.password)
-                self.child.expect(self.PROMPT)
-            self.child.sendline("terminal length 0")
-            self.child.expect(self.PROMPT)
-        except (pexpect.EOF, pexpect.TIMEOUT) as e:
-            self.logger.error(f"SSH login to {self.host} failed (connection/auth error): {e}")
+            SyncSwitch(
+                get_model(model_key), host, http_password=self.password,
+            ).upload_certificate_scp(
+                scp_source=self.scp_source,
+                scp_password=self.scp_password,
+                remote_dir=self.staging_dir,
+                chain=chain_file is not None,
+            )
+        except Exception as exc:  # noqa: BLE001 - surface any library failure as a clean False
+            self.logger.error(f"library SCP cert upload failed for {model_key}: {exc}")
             return False
         return True
 
-    def _send_copy(self, filename: str, dest: str) -> None:
-        """Issue one `copy scp://.../<filename> <dest>` and drive its prompts."""
-        cmd = fastpath_copy_cmd(self._source_url(filename), dest)
-        self.child.sendline(cmd)
-        # FASTPATH may (a) prompt host-key TOFU, (b) prompt remote password,
-        # (c) ask (y/n) to overwrite, then (d) return to prompt.
-        import pexpect
-        for _ in range(8):
-            try:
-                idx = self.child.expect([
-                    r"host key.*\?|continue connecting.*\?|\(yes/no.*\)",   # 0 TOFU
-                    r"[Pp]assword:",                                         # 1 remote pw
-                    self.CONFIRM,                                            # 2 (y/n)
-                    r"[Tt]ransfer failed|[Ff]ailed!|% *Error|[Ee]rror during",  # 3 failure
-                    r"bytes transferred|completed successfully|operation completed",  # 4 success
-                    self.PROMPT,                                             # 5 prompt
-                ], timeout=90)
-            except (pexpect.EOF, pexpect.TIMEOUT) as e:
-                self.logger.error(f"copy transfer for {dest} died: {e}")
-                raise RuntimeError(f"copy failed for {dest}")
-            if idx == 0:
-                self.child.sendline("yes")
-            elif idx == 1:
-                self.child.sendline(self.scp_password)
-            elif idx == 2:
-                self.child.send("y")
-            elif idx == 3:
-                self.logger.error(f"switch reported transfer failure for {dest}")
-                raise RuntimeError(f"copy failed for {dest} (switch reported failure)")
-            elif idx == 4:
-                self.child.expect(self.PROMPT)
-                return
-            else:  # PROMPT reached
-                return
-        raise RuntimeError(f"copy did not complete: {dest}")
-
-    def upload_certificate(self, cert_file, key_file, chain_file=None) -> bool:
-        # staging is written by the caller (main); here we drive the switch.
-        # FASTPATH refuses the sslpem upload while the HTTP secure-server is
-        # enabled ("HTTP Secure-server must be disabled prior to upgrade"), so
-        # disable -> copy -> re-enable. Re-enabling loads the new cert; no reboot.
-        # (These are EXEC-mode commands on every FASTPATH family here.)
-        self.child.sendline("no ip http secure-server")
-        self.child.expect(self.PROMPT)
-        self._send_copy(f"{self.base}-server.pem", "nvram:sslpem-server")
-        if chain_file is not None:
-            self._send_copy(f"{self.base}-root.pem", "nvram:sslpem-root")
-        self.child.sendline("ip http secure-server")
-        self.child.expect(self.PROMPT)
-        # persist
-        if self.profile["writemem_stuff"]:
-            # GSM confirm timeout is tiny — pre-stuff the y before the prompt lands
-            self.child.send("write memory\ry\r")
-            self.child.expect(self.PROMPT)
-        else:
-            self.child.sendline("write memory")
-            idx = self.child.expect([self.CONFIRM, self.PROMPT])
-            if idx == 0:
-                self.child.send("y")
-                self.child.expect(self.PROMPT)
-        return True
-
     def logout(self) -> None:
-        if self.child is not None:
-            try:
-                self.child.sendline("quit")
-                self.child.close()
-            except Exception:
-                pass
+        # No-op: the library owns and closes its own SSH transport.
+        pass
 
     def verify(self, cert_file: str) -> bool:
         return self.verify_certificate(cert_file, https_port=self.profile["verify_port"])
