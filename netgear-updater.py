@@ -35,6 +35,7 @@ Usage standalone:
 
 import argparse
 import os
+import pwd
 import sys
 import re
 import requests
@@ -50,6 +51,47 @@ requests.packages.urllib3.disable_warnings(
 
 REQUEST_TIMEOUT = 10.0
 
+MODEL_PROFILES = {
+    # writemem_stuff: the GSM7252PS `write memory` confirm has a tiny timeout,
+    #   so pre-stuff the `y` in one write; the M4300s use a normal confirm.
+    "M4300-24X": {"crypto": "modern", "verify_port": 443, "writemem_stuff": False},
+    "M4300-16X": {"crypto": "modern", "verify_port": 49152, "writemem_stuff": False},
+    "GSM7252PS": {"crypto": "legacy", "verify_port": 443, "writemem_stuff": True},
+}
+
+# ssh options shared by all FASTPATH targets. Switches regenerate their host
+# keys on firmware updates / factory resets, so we do not pin them (that would
+# block unattended renewal); the connection is on the trusted mgmt VLAN and the
+# end-to-end TLS fingerprint check is the real assurance the cert deployed.
+_SSH_OPTS_COMMON = [
+    "-o", "PubkeyAuthentication=no",
+    "-o", "StrictHostKeyChecking=no",
+    "-o", "UserKnownHostsFile=/dev/null",
+    "-o", "LogLevel=ERROR",
+    "-o", "NumberOfPasswordPrompts=1",
+]
+# extra options required to negotiate with the GSM7252PS' OpenSSH 4.3 server
+# (the M4300s use default modern algorithms; ten64's per-host ssh_config KEX
+# restriction for the switch subnet is fixed to be permissive, not legacy-only)
+_SSH_OPTS_LEGACY = [
+    "-o", "HostKeyAlgorithms=+ssh-rsa",
+    "-o", "PubkeyAcceptedAlgorithms=+ssh-rsa",
+    "-o", "KexAlgorithms=+diffie-hellman-group14-sha1,diffie-hellman-group-exchange-sha1",
+    "-o", "Ciphers=+aes256-ctr,aes256-cbc,aes128-cbc",
+    "-o", "MACs=+hmac-sha1",
+]
+
+
+def fastpath_ssh_opts(crypto: str) -> list:
+    opts = list(_SSH_OPTS_COMMON)
+    if crypto == "legacy":
+        opts += _SSH_OPTS_LEGACY
+    return opts
+
+
+def fastpath_copy_cmd(source_url: str, dest: str) -> str:
+    return f"copy {source_url} {dest}"
+
 
 class NetgearSwitchUpdater:
     """Base class for Netgear switch certificate updaters."""
@@ -58,8 +100,6 @@ class NetgearSwitchUpdater:
         self.switch_url = switch_url.rstrip('/')
         self.username = username
         self.password = password
-        self.session = requests.Session()
-        self.session.verify = False
         self.logger = logging.getLogger(self.__class__.__name__)
 
     def login(self) -> bool:
@@ -129,7 +169,7 @@ class NetgearSwitchUpdater:
         self.logger.error(f"Switch did not come back online within {timeout}s")
         return False
 
-    def verify_certificate(self, cert_file: str) -> bool:
+    def verify_certificate(self, cert_file: str, https_port: int = 443) -> bool:
         """
         Verify the switch is serving the expected certificate via HTTPS.
 
@@ -172,7 +212,7 @@ class NetgearSwitchUpdater:
         try:
             url_parts = urlparse(self.switch_url)
             hostname = url_parts.hostname
-            port = 443
+            port = https_port
 
             # Use permissive SSL context for legacy switches with weak ciphers/DH
             context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
@@ -180,6 +220,18 @@ class NetgearSwitchUpdater:
             context.verify_mode = ssl.CERT_NONE
             # Allow legacy renegotiation and weak DH for old switches
             context.set_ciphers('DEFAULT:@SECLEVEL=0')
+            # The GSM7252PS only offers TLS1.0/SSL3 and lacks RFC5746 secure
+            # renegotiation; allow both so we can read its served cert.
+            try:
+                import warnings
+                with warnings.catch_warnings():
+                    # TLSv1 is deprecated but the GSM7252PS only speaks TLS1.0;
+                    # silence the noise so it doesn't look like a renewal error.
+                    warnings.simplefilter("ignore", DeprecationWarning)
+                    context.minimum_version = ssl.TLSVersion.TLSv1
+            except (ValueError, OSError):
+                pass
+            context.options |= getattr(ssl, "OP_LEGACY_SERVER_CONNECT", 0x4)
 
             with socket.create_connection((hostname, port), timeout=REQUEST_TIMEOUT) as sock:
                 with context.wrap_socket(sock, server_hostname=hostname) as ssock:
@@ -202,7 +254,16 @@ class NetgearSwitchUpdater:
             return False
 
 
-class GS728TPPUpdater(NetgearSwitchUpdater):
+class HttpUpdater(NetgearSwitchUpdater):
+    """Base for switches driven over the HTTP web UI (requests.Session)."""
+
+    def __init__(self, switch_url: str, username: str, password: str):
+        super().__init__(switch_url, username, password)
+        self.session = requests.Session()
+        self.session.verify = False
+
+
+class GS728TPPUpdater(HttpUpdater):
     """
     Certificate updater for GS728TPP ProSafe Smart Switch.
 
@@ -512,7 +573,7 @@ class GS728TPPUpdater(NetgearSwitchUpdater):
         return True
 
 
-class S3300Updater(NetgearSwitchUpdater):
+class S3300Updater(HttpUpdater):
     """
     Certificate updater for S3300 series switches.
 
@@ -703,6 +764,173 @@ class S3300Updater(NetgearSwitchUpdater):
         return False
 
 
+class FastpathScpUpdater(NetgearSwitchUpdater):
+    """Deploy a cert to a Netgear FASTPATH switch (M4300, GSM7252PS) over SSH.
+
+    Pulls the cert+key file into nvram:sslpem-server via the switch's
+    `copy scp://<switchcert>@ten64/...` command, then reloads HTTPS in place.
+    Never reboots.
+    """
+
+    PROMPT = r"\([^)\r\n]{1,64}\)\s*[>#]"
+    CONFIRM = r"\(y/n\)"
+
+    def __init__(self, switch_url, username, password, *, model_key,
+                 scp_source, scp_password, staging_dir):
+        super().__init__(switch_url, username, password)
+        if model_key not in MODEL_PROFILES:
+            raise ValueError(f"Unknown FASTPATH model: {model_key}")
+        self.model_key = model_key
+        self.profile = MODEL_PROFILES[model_key]
+        self.scp_source = scp_source            # "switchcert@10.1.5.1:2222"
+        self.scp_password = scp_password
+        self.staging_dir = staging_dir
+        self.host = urlparse(self.switch_url).hostname
+        # FASTPATH copy-scp has a short (~55 char) limit on the remote path AND
+        # rejects dots in the filename. Use the dot-sanitised mgmt IP as the
+        # staged base ("10-1-5-22"): dot-free, unique-per-switch, and short
+        # enough (full path stays well under the limit for the mgmt subnet).
+        self.base = self.host.replace(".", "-")
+        self.child = None
+
+    # --- pure helpers -----------------------------------------------------
+    def _source_url(self, filename: str) -> str:
+        # absolute staging path so FASTPATH's scp requests the exact path the
+        # ForceCommand wrapper authorises (no home-relative ambiguity)
+        return f"scp://{self.scp_source}{self.staging_dir}/{filename}"
+
+    def reboot(self) -> bool:
+        raise RuntimeError("FastpathScpUpdater never reboots (backbone-safe)")
+
+    # --- pexpect session --------------------------------------------------
+    def login(self) -> bool:
+        import pexpect
+        opts = fastpath_ssh_opts(self.profile["crypto"]) + ["-tt"]
+        self.child = pexpect.spawn(
+            "ssh", opts + [f"{self.username}@{self.host}"],
+            encoding="utf-8", timeout=45)
+        try:
+            self.child.expect(r"[Pp]assword:")
+            self.child.sendline(self.password)
+            self.child.expect(self.PROMPT)
+            self.child.sendline("enable")
+            idx = self.child.expect([r"[Pp]assword:", self.PROMPT])
+            if idx == 0:
+                self.child.sendline(self.password)
+                self.child.expect(self.PROMPT)
+            self.child.sendline("terminal length 0")
+            self.child.expect(self.PROMPT)
+        except (pexpect.EOF, pexpect.TIMEOUT) as e:
+            self.logger.error(f"SSH login to {self.host} failed (connection/auth error): {e}")
+            return False
+        return True
+
+    def _send_copy(self, filename: str, dest: str) -> None:
+        """Issue one `copy scp://.../<filename> <dest>` and drive its prompts."""
+        cmd = fastpath_copy_cmd(self._source_url(filename), dest)
+        self.child.sendline(cmd)
+        # FASTPATH may (a) prompt host-key TOFU, (b) prompt remote password,
+        # (c) ask (y/n) to overwrite, then (d) return to prompt.
+        import pexpect
+        for _ in range(8):
+            try:
+                idx = self.child.expect([
+                    r"host key.*\?|continue connecting.*\?|\(yes/no.*\)",   # 0 TOFU
+                    r"[Pp]assword:",                                         # 1 remote pw
+                    self.CONFIRM,                                            # 2 (y/n)
+                    r"[Tt]ransfer failed|[Ff]ailed!|% *Error|[Ee]rror during",  # 3 failure
+                    r"bytes transferred|completed successfully|operation completed",  # 4 success
+                    self.PROMPT,                                             # 5 prompt
+                ], timeout=90)
+            except (pexpect.EOF, pexpect.TIMEOUT) as e:
+                self.logger.error(f"copy transfer for {dest} died: {e}")
+                raise RuntimeError(f"copy failed for {dest}")
+            if idx == 0:
+                self.child.sendline("yes")
+            elif idx == 1:
+                self.child.sendline(self.scp_password)
+            elif idx == 2:
+                self.child.send("y")
+            elif idx == 3:
+                self.logger.error(f"switch reported transfer failure for {dest}")
+                raise RuntimeError(f"copy failed for {dest} (switch reported failure)")
+            elif idx == 4:
+                self.child.expect(self.PROMPT)
+                return
+            else:  # PROMPT reached
+                return
+        raise RuntimeError(f"copy did not complete: {dest}")
+
+    def upload_certificate(self, cert_file, key_file, chain_file=None) -> bool:
+        # staging is written by the caller (main); here we drive the switch.
+        # FASTPATH refuses the sslpem upload while the HTTP secure-server is
+        # enabled ("HTTP Secure-server must be disabled prior to upgrade"), so
+        # disable -> copy -> re-enable. Re-enabling loads the new cert; no reboot.
+        # (These are EXEC-mode commands on every FASTPATH family here.)
+        self.child.sendline("no ip http secure-server")
+        self.child.expect(self.PROMPT)
+        self._send_copy(f"{self.base}-server.pem", "nvram:sslpem-server")
+        if chain_file is not None:
+            self._send_copy(f"{self.base}-root.pem", "nvram:sslpem-root")
+        self.child.sendline("ip http secure-server")
+        self.child.expect(self.PROMPT)
+        # persist
+        if self.profile["writemem_stuff"]:
+            # GSM confirm timeout is tiny — pre-stuff the y before the prompt lands
+            self.child.send("write memory\ry\r")
+            self.child.expect(self.PROMPT)
+        else:
+            self.child.sendline("write memory")
+            idx = self.child.expect([self.CONFIRM, self.PROMPT])
+            if idx == 0:
+                self.child.send("y")
+                self.child.expect(self.PROMPT)
+        return True
+
+    def logout(self) -> None:
+        if self.child is not None:
+            try:
+                self.child.sendline("quit")
+                self.child.close()
+            except Exception:
+                pass
+
+    def verify(self, cert_file: str) -> bool:
+        return self.verify_certificate(cert_file, https_port=self.profile["verify_port"])
+
+
+def stage_server_pem(staging_dir, base, cert_file, key_file, chain_file=None, owner=None):
+    os.makedirs(staging_dir, exist_ok=True)
+    uid = gid = None
+    if owner is not None:
+        pw = pwd.getpwnam(owner)
+        uid, gid = pw.pw_uid, pw.pw_gid
+    with open(cert_file, "rb") as f: cert = f.read()
+    with open(key_file, "rb") as f: key = f.read()
+    server = os.path.join(staging_dir, f"{base}-server.pem")
+    with open(server, "wb") as f:
+        f.write(cert)
+        if not cert.endswith(b"\n"): f.write(b"\n")
+        f.write(key)
+    os.chmod(server, 0o400)
+    if owner is not None:
+        os.chown(server, uid, gid)
+    root = None
+    if chain_file is not None:
+        with open(chain_file, "rb") as f: chain = f.read()
+        root = os.path.join(staging_dir, f"{base}-root.pem")
+        with open(root, "wb") as f: f.write(chain)
+        os.chmod(root, 0o400)
+        if owner is not None:
+            os.chown(root, uid, gid)
+    return server, root
+
+def cleanup_staging(paths):
+    for p in paths:
+        if p and os.path.exists(p):
+            os.unlink(p)
+
+
 def parse_cert_info(pem_file: str) -> dict:
     """Parse certificate info: expiry date and key type."""
     try:
@@ -783,24 +1011,37 @@ def detect_switch_model(switch_url: str) -> str:
     return "unknown"
 
 
-def create_updater(switch_url: str, username: str, password: str,
-                   model: str = None) -> NetgearSwitchUpdater:
-    """Create the appropriate updater for the switch model."""
+def create_updater(switch_url, username, password, model=None, *,
+                   scp_source=None, scp_password=None, staging_dir=None):
     if model is None:
         model = detect_switch_model(switch_url)
+    m = model.upper()
 
-    model_upper = model.upper()
+    fastpath_key = None
+    if m.startswith("M4300-24X"):
+        fastpath_key = "M4300-24X"
+    elif m.startswith("M4300-16X") or m == "M4300":
+        fastpath_key = "M4300-16X"
+    elif m.startswith("GSM7252PS"):
+        fastpath_key = "GSM7252PS"
 
-    if model_upper == "GS728TPP":
+    if fastpath_key:
+        if not (scp_source and scp_password and staging_dir):
+            raise ValueError("FASTPATH deploy needs scp_source/scp_password/staging_dir")
+        return FastpathScpUpdater(
+            switch_url, username, password, model_key=fastpath_key,
+            scp_source=scp_source, scp_password=scp_password, staging_dir=staging_dir)
+
+    if m == "GS728TPP":
         return GS728TPPUpdater(switch_url, username, password)
-    elif model_upper in ("S3300", "S3300-28X", "S3300-52X",
-                         "S3300-28X-POE", "S3300-52X-POE", "S3300-52X-POE+"):
+    if m in ("S3300", "S3300-28X", "S3300-52X", "S3300-28X-POE",
+             "S3300-52X-POE", "S3300-52X-POE+"):
         return S3300Updater(switch_url, username, password)
 
     raise ValueError(f"Unknown or unsupported switch model: {model}")
 
 
-def main():
+def build_parser():
     parser = argparse.ArgumentParser(
         description='Upload SSL certificates to Netgear managed switches',
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -839,6 +1080,17 @@ Examples:
                         help='Suppress output on success')
     parser.add_argument('--debug', action='store_true',
                         help='Enable debug output')
+    parser.add_argument('--scp-source', help='switchcert SCP source "user@host:port" (FASTPATH)')
+    parser.add_argument('--scp-password-file', help='file holding the switchcert password (FASTPATH)')
+    parser.add_argument('--staging-dir', default='/var/lib/switchcert/staging',
+                        help='directory the switchcert sshd serves (FASTPATH)')
+    parser.add_argument('--cert-name', help='certbot lineage / cert-name (for logging + base)')
+    parser.add_argument('--chain-file', help='CA chain PEM -> nvram:sslpem-root (FASTPATH, optional)')
+    return parser
+
+
+def main():
+    parser = build_parser()
     args = parser.parse_args()
 
     # Set up logging
@@ -871,7 +1123,10 @@ Examples:
             args.switch_url,
             args.username,
             args.password,
-            args.model
+            args.model,
+            scp_source=args.scp_source,
+            scp_password=("x" if args.scp_source else None),
+            staging_dir=args.staging_dir,
         )
     except ValueError as e:
         logger.error(str(e))
@@ -880,6 +1135,31 @@ Examples:
     if not args.quiet:
         model_name = args.model or type(updater).__name__.replace('Updater', '')
         logger.info(f"Connecting to {model_name} at {args.switch_url}...")
+
+    if isinstance(updater, FastpathScpUpdater):
+        scp_password = ""
+        if args.scp_password_file:
+            with open(args.scp_password_file) as f:
+                scp_password = f.read().strip()
+        if not scp_password:
+            logger.error("FASTPATH deploy requires --scp-password-file with non-empty content")
+            sys.exit(2)
+        updater.scp_password = scp_password
+        server, root = stage_server_pem(args.staging_dir, updater.base,
+                                        args.cert_file, args.key_file,
+                                        args.chain_file, owner="switchcert")
+        try:
+            if not updater.login():
+                logger.error("SSH login failed"); sys.exit(2)
+            updater.upload_certificate(args.cert_file, args.key_file,
+                                       chain_file=root)
+            updater.logout()
+            if not updater.verify(args.cert_file):
+                logger.error("Certificate verification failed"); sys.exit(2)
+        finally:
+            cleanup_staging([server, root])
+        logger.info("Certificate deployed + verified")
+        return
 
     # Login to switch
     if not updater.login():
